@@ -157,21 +157,6 @@ func writeRelayError(w http.ResponseWriter, status int, message string) {
 	w.Write(body)
 }
 
-// relayHost returns the public base URL of this relay service.
-func relayHost(r *http.Request) string {
-	proto := "https"
-	if r.TLS == nil {
-		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
-			proto = xfp
-		}
-	}
-	host := r.Host
-	if host == "" {
-		host = r.URL.Host
-	}
-	return proto + "://" + host
-}
-
 // healthHandler reports relay service health without hitting the upstream.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]string{
@@ -186,14 +171,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-// indexHandler renders a landing page describing how to use the relay.
+// indexHandler renders a landing page.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	baseURL := relayHost(r)
-	html := indexHTML(baseURL)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(html))
+	w.Write([]byte("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>已部署</title></head><body><p>您已成功部署本项目</p></body></html>"))
 }
 
 // Handler is the Vercel serverless entry point.
