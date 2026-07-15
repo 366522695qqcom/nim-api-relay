@@ -1,0 +1,10 @@
+# Binary
+nim-relay
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
