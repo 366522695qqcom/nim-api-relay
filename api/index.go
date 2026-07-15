@@ -157,8 +157,57 @@ func writeRelayError(w http.ResponseWriter, status int, message string) {
 	w.Write(body)
 }
 
+// relayHost returns the public base URL of this relay service.
+func relayHost(r *http.Request) string {
+	proto := "https"
+	if r.TLS == nil {
+		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
+			proto = xfp
+		}
+	}
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	return proto + "://" + host
+}
+
+// healthHandler reports relay service health without hitting the upstream.
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	payload := map[string]string{
+		"status":   "ok",
+		"service":  "nim-relay",
+		"upstream": upstreamURL().String(),
+	}
+	body, _ := json.Marshal(payload)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
+// indexHandler renders a landing page describing how to use the relay.
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	baseURL := relayHost(r)
+	html := indexHTML(baseURL)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
+}
+
 // Handler is the Vercel serverless entry point.
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// Non-API paths served locally without hitting the upstream.
+	switch r.URL.Path {
+	case "/", "/index.html":
+		indexHandler(w, r)
+		return
+	case "/health", "/healthz":
+		healthHandler(w, r)
+		return
+	}
+
 	target := upstreamURL()
 
 	var bodyBytes []byte
