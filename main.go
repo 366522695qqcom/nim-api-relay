@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"nim-relay/internal/relay"
+	"nim-relay/api"
 )
 
 func main() {
@@ -15,11 +15,9 @@ func main() {
 		port = "8080"
 	}
 
-	handler := relay.NewHandler()
-
 	addr := ":" + port
 	log.Printf("nim-relay listening on %s (upstream from UPSTREAM_URL)", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	if err := http.ListenAndServe(addr, http.HandlerFunc(api.Handler)); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }

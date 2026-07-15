@@ -1,11 +1,6 @@
 {
   "version": 2,
-  "functions": {
-    "api/index.go": {
-      "maxDuration": 300
-    }
-  },
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/index" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ]
 }

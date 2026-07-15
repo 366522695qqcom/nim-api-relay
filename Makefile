@@ -1,6 +1,6 @@
 .PHONY: run build vet test clean
 
-# 本地运行（需要先设置环境变量 NVIDIA_API_KEYS）
+# 本地运行
 run:
 	go run main.go
 
