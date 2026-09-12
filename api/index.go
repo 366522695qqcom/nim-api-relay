@@ -57,7 +57,7 @@ func buildUpstreamURL(target *url.URL, r *http.Request) string {
 
 var upstreamClient = func() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.ResponseHeaderTimeout = 120 * time.Second
 	return &http.Client{Transport: transport}
 }()
 

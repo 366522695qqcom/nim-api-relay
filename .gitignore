@@ -8,3 +8,7 @@ nim-relay
 .idea/
 .vscode/
 *.swp
+.vercel
+
+# 含硬编码 NVIDIA API Key 的本地测试脚本，避免误提交泄漏密钥
+test_nvidia.py
