@@ -158,7 +158,6 @@ curl https://your-vercel-domain.vercel.app/health
 | `ADMIN_PASSWORD` | 否 | 空 | 访问 `/admin` 的密码，追加到 URL 的 `?token=密码` |
 | `KV_REST_API_URL` | 否 | 空 | 管理面板统计持久化（Vercel KV / Upstash Redis）REST 地址 |
 | `KV_REST_API_TOKEN` | 否 | 空 | 管理面板统计持久化对应的 REST Token |
-| `STRIP_FIELDS` | 否 | 空 | 转发前额外剔除的请求体字段（逗号分隔）。默认已处理 `stream_options` 与 `stream` 组合问题；可用此变量剔除客户端携带的其它非标准字段（如 `metadata,custom_field`），规避上游 400 |
 
 示例见 [.env.example](.env.example)。
 
