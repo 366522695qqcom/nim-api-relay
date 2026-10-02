@@ -57,9 +57,17 @@ func buildUpstreamURL(target *url.URL, r *http.Request) string {
 
 var upstreamClient = func() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = 120 * time.Second
+	// Slow reasoning models (e.g. moonshotai/kimi-k3) can take a long time to
+	// send their first response header. Give them ample time to avoid 502s.
+	transport.ResponseHeaderTimeout = 300 * time.Second
 	return &http.Client{Transport: transport}
 }()
+
+// isResponsesPath reports whether the request targets the OpenAI Responses API.
+func isResponsesPath(path string) bool {
+	p := strings.TrimRight(strings.ToLower(path), "/")
+	return p == "/v1/responses" || p == "/responses"
+}
 
 func buildUpstreamRequest(target *url.URL, r *http.Request, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, buildUpstreamURL(target, r), body)
@@ -188,6 +196,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/health", "/healthz":
 		healthHandler(w, r)
+		return
+	}
+
+	// Kimi desktop clients talk the OpenAI Responses API. Translate it to the
+	// Chat Completions protocol the upstream understands.
+	if isResponsesPath(r.URL.Path) {
+		handleResponses(w, r)
 		return
 	}
 
