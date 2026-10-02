@@ -197,7 +197,28 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	case "/health", "/healthz":
 		healthHandler(w, r)
 		return
+	case "/admin", "/admin/":
+		adminHandler(w, r)
+		return
 	}
+
+	// Cap request body size to prevent memory exhaustion from oversized payloads.
+	const maxBodyBytes = 10 << 20 // 10 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+	// Capture request metadata for the admin stats/logs.
+	entry := requestLog{
+		ip:      clientIP(r),
+		path:    r.URL.Path,
+		model:   extractModel(r),
+		keyMask: maskKey(r),
+		start:   time.Now(),
+	}
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	defer func() {
+		record(entry, sw.status)
+	}()
+	w = sw
 
 	// Kimi desktop clients talk the OpenAI Responses API. Translate it to the
 	// Chat Completions protocol the upstream understands.
