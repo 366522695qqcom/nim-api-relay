@@ -69,17 +69,6 @@ func isResponsesPath(path string) bool {
 	return p == "/v1/responses" || p == "/responses"
 }
 
-// normalizeAPIPath maps vendor-agnostic API paths that omit the /v1 prefix to
-// the OpenAI-style path the upstream expects, so clients whose base_url does
-// not end with /v1 still work.
-func normalizeAPIPath(path string) string {
-	switch strings.TrimRight(strings.ToLower(path), "/") {
-	case "/chat/completions":
-		return "/v1/chat/completions"
-	}
-	return path
-}
-
 func buildUpstreamRequest(target *url.URL, r *http.Request, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, buildUpstreamURL(target, r), body)
 	if err != nil {
@@ -212,10 +201,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		adminHandler(w, r)
 		return
 	}
-
-	// Normalize vendor-agnostic API paths (e.g. /chat/completions without the
-	// /v1 prefix) so they reach the OpenAI-style endpoint the upstream expects.
-	r.URL.Path = normalizeAPIPath(r.URL.Path)
 
 	// Cap request body size to prevent memory exhaustion from oversized payloads.
 	const maxBodyBytes = 10 << 20 // 10 MiB

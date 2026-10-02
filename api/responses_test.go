@@ -174,25 +174,6 @@ func TestIsResponsesPath(t *testing.T) {
 	}
 }
 
-func TestNormalizeAPIPath(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"/chat/completions", "/v1/chat/completions"},
-		{"/Chat/Completions", "/v1/chat/completions"},
-		{"/v1/chat/completions", "/v1/chat/completions"},
-		{"/responses", "/responses"},
-		{"/v1/responses", "/v1/responses"},
-		{"/models", "/models"},
-		{"/", "/"},
-	}
-	for _, c := range cases {
-		if got := normalizeAPIPath(c.in); got != c.want {
-			t.Errorf("normalizeAPIPath(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func TestTrimSlash(t *testing.T) {
 	if got := trimSlash(""); got != "" {
 		t.Errorf("trimSlash empty = %q", got)
