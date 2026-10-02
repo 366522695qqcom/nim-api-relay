@@ -71,64 +71,6 @@ type responsesRequest struct {
 	ResponseFormat  json.RawMessage `json:"response_format"`
 }
 
-// normalizeMessageContent converts a Responses content value into a Chat
-// Completions-compatible content value. Strings pass through unchanged; arrays
-// of content blocks are normalized block-by-block (Responses-only types such as
-// input_text / input_image are remapped to text / image_url); unmappable blocks
-// are dropped. If the resulting array is empty, an empty string is returned so
-// the content does not become null or an empty array.
-func normalizeMessageContent(v interface{}) interface{} {
-	switch val := v.(type) {
-	case string:
-		return val
-	case []interface{}:
-		out := make([]interface{}, 0, len(val))
-		for _, block := range val {
-			m, ok := block.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			typ, _ := m["type"].(string)
-			switch typ {
-			case "input_text", "output_text":
-				c := shallowCopyMap(m)
-				c["type"] = "text"
-				out = append(out, c)
-			case "input_image", "input_image_url":
-				c := shallowCopyMap(m)
-				c["type"] = "image_url"
-				if _, hasImageURL := c["image_url"]; !hasImageURL {
-					if u, hasURL := c["url"]; hasURL {
-						c["image_url"] = u
-					}
-				}
-				out = append(out, c)
-			case "text", "image_url":
-				out = append(out, m)
-			default:
-				// Other Responses-only block types cannot be mapped to Chat
-				// Completions content blocks, so drop them.
-			}
-		}
-		if len(out) == 0 {
-			return ""
-		}
-		return out
-	default:
-		return val
-	}
-}
-
-// shallowCopyMap returns a shallow copy of m so that callers can mutate fields
-// (e.g. type) without mutating the original block.
-func shallowCopyMap(m map[string]interface{}) map[string]interface{} {
-	c := make(map[string]interface{}, len(m))
-	for k, val := range m {
-		c[k] = val
-	}
-	return c
-}
-
 // responsesInputToMessages converts a Responses `input` value (either a plain
 // string or an array of message items) into Chat Completions `messages`.
 func responsesInputToMessages(in json.RawMessage) ([]map[string]interface{}, error) {
@@ -166,10 +108,6 @@ func responsesInputToMessages(in json.RawMessage) ([]map[string]interface{}, err
 		content := obj["content"]
 		if content == nil {
 			content = ""
-		}
-		content = normalizeMessageContent(content)
-		if role == "developer" {
-			role = "system"
 		}
 		out = append(out, map[string]interface{}{"role": role, "content": content})
 	}
