@@ -260,6 +260,18 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		body = bytes.NewReader(bodyBytes)
 	}
 
+	// Clean the Chat Completions request body so upstream-unfriendly fields
+	// (e.g. stream_options without streaming, or STRIP_FIELDS overrides) do not
+	// cause a 400 from the upstream NVIDIA endpoint.
+	cleaned, err := sanitizeChatRequest(bodyBytes)
+	if err != nil {
+		writeRelayError(w, http.StatusBadGateway, "failed to sanitize request body")
+		return
+	}
+	if len(cleaned) > 0 {
+		body = bytes.NewReader(cleaned)
+	}
+
 	req, err := buildUpstreamRequest(target, r, body)
 	if err != nil {
 		writeRelayError(w, http.StatusBadGateway, "failed to build upstream request")
