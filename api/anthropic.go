@@ -357,29 +357,6 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 
-	resp, err := upstreamClient.Do(req)
-	if err != nil {
-		logf("relay: messages upstream request failed: %v", err)
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed")
-		return
-	}
-	defer resp.Body.Close()
-	diagUpstream = resp.StatusCode
-
-	if resp.StatusCode != http.StatusOK {
-		// Surface upstream errors as Anthropic-style errors, preserving the
-		// status code, rather than passing the raw body verbatim. This runs
-		// before the stream branch below, so a streaming request that fails
-		// upstream with a 4xx still yields a proper {"type":"error",...} JSON.
-		body, _ := readAllCloser(resp.Body)
-		diagUpErr = extractErrorMessage(body)
-		// Re-seat the (consumed) body so replaceWithAnthropicError can write the
-		// envelope; the extracted message feeds the diagnostics log.
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		replaceWithAnthropicError(w, resp)
-		return
-	}
-
 	isStream := false
 	var p struct {
 		Stream bool `json:"stream"`
@@ -389,8 +366,52 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	diagStream = isStream
 
+	// For streaming requests, open the Anthropic SSE response (message_start,
+	// keepalive ping, content_block_start) BEFORE waiting on the upstream
+	// request. Slow reasoning models can take a long time to send their first
+	// header; sending the ping now prevents the client's connect->first-byte
+	// window from timing out.
+	var stream *anthropicStream
 	if isStream {
-		streamChatCompletionToAnthropic(w, resp)
+		stream = openAnthropicStream(w, nil)
+	}
+
+	resp, err := upstreamClient.Do(req)
+	if err != nil {
+		logf("relay: messages upstream request failed: %v", err)
+		if stream != nil {
+			stream.sendError("upstream request failed")
+			stream.sendMessageStop()
+			return
+		}
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed")
+		return
+	}
+	defer resp.Body.Close()
+	diagUpstream = resp.StatusCode
+
+	if resp.StatusCode != http.StatusOK {
+		// Surface upstream errors as Anthropic-style envelopes rather than the
+		// raw body. If the stream was already opened with a 200, surface the
+		// failure as an Anthropic `error` SSE event; otherwise emit a proper
+		// {"type":"error",...} JSON preserving the status code.
+		body, _ := readAllCloser(resp.Body)
+		upErr := extractErrorMessage(body)
+		diagUpErr = upErr
+		if stream != nil {
+			stream.sendError(upErr)
+			stream.sendMessageStop()
+			return
+		}
+		// Re-seat the (consumed) body so replaceWithAnthropicError can write the
+		// envelope; the extracted message feeds the diagnostics log.
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		replaceWithAnthropicError(w, resp)
+		return
+	}
+
+	if isStream {
+		stream.readBody(resp)
 		return
 	}
 
@@ -411,58 +432,39 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	w.Write(converted)
 }
 
-// streamChatCompletionToAnthropic converts a Chat Completions SSE stream into
-// an Anthropic Messages SSE event stream (message_start … message_stop). It
-// emits each event incrementally as upstream chunks arrive (rather than
-// buffering the whole stream) so the client sees the first output immediately.
-func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response) {
-	defer resp.Body.Close()
+// anthropicStream carries the shared state for an open Anthropic Messages SSE
+// response and the helper used to write and flush each event.
+type anthropicStream struct {
+	sendEvent    func(event, data string)
+	msgID        string
+	model        string
+	finished     string
+	outputTokens int
+}
 
-	flusher, _ := w.(http.Flusher)
-	copyStreamHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	sendEvent := func(event, data string) {
-		if _, err := io.WriteString(w, "event: "+event+"\ndata: "+data+"\n\n"); err != nil {
-			return
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-
-	msgID := anthropicMessageID()
-	// model may be unknown before the first upstream chunk arrives; start with
-	// a placeholder and fill it in as soon as a chunk provides one.
-	model := "unknown"
-	finished := "end_turn"
-	outputTokens := 0
-
-	mustJSON := func(v interface{}) string {
-		b, _ := json.Marshal(v)
-		return string(b)
-	}
-
-	// The lifecycle events are emitted immediately, before reading any upstream
-	// chunk, so that the first byte does not wait for the whole response.
-	sendEvent("message_start", mustJSON(map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id":            msgID,
-			"type":          "message",
-			"role":          "assistant",
-			"model":         model,
-			"content":       []interface{}{},
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage": map[string]interface{}{
-				"input_tokens":  0,
-				"output_tokens": 0,
-			},
+// sendError emits an Anthropic SSE `error` event (never raw Chat Completions
+// chunk JSON), used when an already-opened stream must surface a failure.
+func (s *anthropicStream) sendError(message string) {
+	s.sendEvent("error", anthropicJSON(map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    "api_error",
+			"message": message,
 		},
 	}))
+}
 
-	sendEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+func (s *anthropicStream) sendMessageStop() {
+	s.sendEvent("message_stop", `{"type":"message_stop"}`)
+}
+
+// readBody consumes the upstream Chat Completions SSE stream and emits the
+// remaining Anthropic events (content_block_delta … content_block_stop,
+// message_delta, optional error, message_stop). The lifecycle opening events
+// (message_start, ping, content_block_start) are emitted by openAnthropicStream
+// before any upstream data is available, so this only needs the delta loop.
+func (s *anthropicStream) readBody(resp *http.Response) {
+	defer resp.Body.Close()
 
 	buf := bufio.NewReaderSize(resp.Body, 4096)
 	var streamErr error
@@ -509,13 +511,13 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 		}
 
 		if chunk.Model != "" {
-			model = chunk.Model
+			s.model = chunk.Model
 		}
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			if delta.Content != "" {
-				outputTokens++
-				sendEvent("content_block_delta", mustJSON(map[string]interface{}{
+				s.outputTokens++
+				s.sendEvent("content_block_delta", anthropicJSON(map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": 0,
 					"delta": map[string]interface{}{
@@ -525,35 +527,96 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 				}))
 			}
 			if chunk.Choices[0].FinishReason != nil {
-				finished = anthropicStopReason(*chunk.Choices[0].FinishReason)
+				s.finished = anthropicStopReason(*chunk.Choices[0].FinishReason)
 			}
 		}
 	}
 
-	sendEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
-	sendEvent("message_delta", mustJSON(map[string]interface{}{
+	s.sendEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
+	s.sendEvent("message_delta", anthropicJSON(map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
-			"stop_reason": finished,
+			"stop_reason": s.finished,
 		},
 		"usage": map[string]interface{}{
 			"input_tokens":  0,
-			"output_tokens": outputTokens,
+			"output_tokens": s.outputTokens,
 		},
 	}))
 	if streamErr != nil {
 		// The upstream stream died before a clean [DONE]: surface an Anthropic
 		// `error` SSE event (never raw Chat Completions chunk JSON) so the
 		// client can report the failure, then close cleanly with message_stop.
-		sendEvent("error", mustJSON(map[string]interface{}{
-			"type": "error",
-			"error": map[string]interface{}{
-				"type":    "api_error",
-				"message": "upstream stream failed: " + streamErr.Error(),
-			},
-		}))
+		s.sendError("upstream stream failed: " + streamErr.Error())
 	}
-	sendEvent("message_stop", `{"type":"message_stop"}`)
+	s.sendMessageStop()
+}
+
+// openAnthropicStream opens an Anthropic Messages SSE response and immediately
+// writes the opening lifecycle events — message_start, a keepalive `ping`, and
+// content_block_start — so the client receives its first byte before the
+// upstream produces any content. Slow reasoning models can take a long time to
+// send their first header, and the ping keeps the client's connect->first-byte
+// window from timing out.
+func openAnthropicStream(w http.ResponseWriter, src http.Header) *anthropicStream {
+	flusher, _ := w.(http.Flusher)
+	copyStreamHeaders(w.Header(), src)
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	s := &anthropicStream{
+		msgID:    anthropicMessageID(),
+		model:    "unknown",
+		finished: "end_turn",
+	}
+	// model may be unknown before the first upstream chunk arrives; start with
+	// a placeholder and fill it in as soon as a chunk provides one.
+	s.sendEvent = func(event, data string) {
+		if _, err := io.WriteString(w, "event: "+event+"\ndata: "+data+"\n\n"); err != nil {
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	s.sendEvent("message_start", anthropicJSON(map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            s.msgID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         s.model,
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}))
+	// Keepalive: open the connection immediately for slow-first-header models.
+	s.sendEvent("ping", `{"type":"ping"}`)
+	s.sendEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+	return s
+}
+
+// streamChatCompletionToAnthropic converts a Chat Completions SSE stream into
+// an Anthropic Messages SSE event stream (message_start … message_stop). It
+// opens the stream first, then emits each `content_block_delta` incrementally
+// as upstream chunks arrive so the client sees the first output immediately.
+func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response) {
+	s := openAnthropicStream(w, resp.Header)
+	s.readBody(resp)
+}
+
+// anthropicJSON marshals v to a compact JSON string for an SSE data payload.
+func anthropicJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // byteCountWriter wraps an http.ResponseWriter to count the bytes written out,

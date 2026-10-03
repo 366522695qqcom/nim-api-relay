@@ -507,9 +507,11 @@ func TestHandleMessagesConversionFailureReturnsEnvelope(t *testing.T) {
 }
 
 func TestHandleMessagesStreamingUpstreamError(t *testing.T) {
-	// A streaming request whose upstream fails with a 4xx must surface as an
-	// Anthropic {"type":"error",...} JSON at HTTP 4xx (before the stream branch),
-	// not raw or SSE garbage.
+	// A streaming request whose upstream fails with a 4xx still opens the SSE
+	// stream first (message_start, keepalive ping, content_block_start) so the
+	// client gets an immediate first byte, then surfaces the failure as an
+	// Anthropic `error` SSE event followed by message_stop. The failure is never
+	// forwarded as raw or mis-shapen garbage.
 	upErr := `{"error":{"message":"upstream exploded"}}`
 	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -529,29 +531,28 @@ func TestHandleMessagesStreamingUpstreamError(t *testing.T) {
 
 	handleMessages(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", rec.Code)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (stream opened before upstream response)", rec.Code)
 	}
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", ct)
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
-	if strings.Contains(rec.Body.String(), "data:") || strings.Contains(rec.Body.String(), "event:") {
-		t.Errorf("streaming error path must not emit SSE garbage:\n%s", rec.Body.String())
+	for _, want := range []string{
+		`event: message_start`,
+		`event: ping`,
+		`event: content_block_start`,
+		`event: error`,
+		`"upstream exploded"`,
+		`event: message_stop`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("streaming error body missing %q:\n%s", want, body)
+		}
 	}
-	var payload struct {
-		Type  string `json:"type"`
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("unmarshal error envelope: %v (body=%s)", err, rec.Body.String())
-	}
-	if payload.Type != "error" {
-		t.Errorf("type = %q, want error", payload.Type)
-	}
-	if payload.Error.Message != "upstream exploded" {
-		t.Errorf("error.message = %q, want %q", payload.Error.Message, "upstream exploded")
+	// The error event must precede message_stop.
+	if strings.Index(body, `event: error`) > strings.Index(body, `event: message_stop`) {
+		t.Errorf("error event must be emitted before message_stop\n%s", body)
 	}
 }
 
