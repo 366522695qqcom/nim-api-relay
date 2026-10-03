@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -439,4 +440,262 @@ func TestWriteAnthropicError(t *testing.T) {
 	if resp.Error.Message != "The model meta/does-not-exist does not exist" {
 		t.Errorf("error.message = %q", resp.Error.Message)
 	}
+}
+
+// roundTripperFunc adapts a function to the http.RoundTripper interface so
+// tests can stub the upstream chat completions client.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// withStubUpstream temporarily replaces upstreamClient with one backed by rt
+// and restores it once the returned function is called.
+func withStubUpstream(rt http.RoundTripper) (restore func()) {
+	orig := upstreamClient
+	upstreamClient = &http.Client{Transport: rt}
+	return func() { upstreamClient = orig }
+}
+
+func TestHandleMessagesConversionFailureReturnsEnvelope(t *testing.T) {
+	// Upstream returns 200 with a body that cannot be converted to an Anthropic
+	// message (it is not valid JSON). The handler must return an Anthropic-style
+	// {"type":"error",...} envelope at HTTP 502 and must never pass the raw body
+	// through with a 200.
+	raw := "not json"
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(raw)),
+		}, nil
+	})
+	restore := withStubUpstream(rt)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handleMessages(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if rec.Body.String() == raw {
+		t.Errorf("raw upstream body was passed through verbatim:\n%s", rec.Body.String())
+	}
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal error envelope: %v (body=%s)", err, rec.Body.String())
+	}
+	if payload.Type != "error" {
+		t.Errorf("type = %q, want error", payload.Type)
+	}
+	if payload.Error.Message == "" {
+		t.Errorf("expected non-empty error message, got body=%s", rec.Body.String())
+	}
+}
+
+func TestHandleMessagesStreamingUpstreamError(t *testing.T) {
+	// A streaming request whose upstream fails with a 4xx must surface as an
+	// Anthropic {"type":"error",...} JSON at HTTP 4xx (before the stream branch),
+	// not raw or SSE garbage.
+	upErr := `{"error":{"message":"upstream exploded"}}`
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Status:     "400 Bad Request",
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(upErr)),
+		}, nil
+	})
+	restore := withStubUpstream(rt)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handleMessages(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if strings.Contains(rec.Body.String(), "data:") || strings.Contains(rec.Body.String(), "event:") {
+		t.Errorf("streaming error path must not emit SSE garbage:\n%s", rec.Body.String())
+	}
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal error envelope: %v (body=%s)", err, rec.Body.String())
+	}
+	if payload.Type != "error" {
+		t.Errorf("type = %q, want error", payload.Type)
+	}
+	if payload.Error.Message != "upstream exploded" {
+		t.Errorf("error.message = %q, want %q", payload.Error.Message, "upstream exploded")
+	}
+}
+
+func TestReplaceWithAnthropicError(t *testing.T) {
+	// Direct check of the helper the handler uses for non-2xx upstream responses.
+	rec := httptest.NewRecorder()
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"bad model"}}`)),
+	}
+	replaceWithAnthropicError(rec, resp)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal error envelope: %v", err)
+	}
+	if payload.Type != "error" {
+		t.Errorf("type = %q, want error", payload.Type)
+	}
+	if payload.Error.Message != "bad model" {
+		t.Errorf("error.message = %q, want %q", payload.Error.Message, "bad model")
+	}
+}
+
+// midStreamErrorBody serves one valid SSE line, then a hard (non-EOF) read error
+// to simulate the upstream stream dying mid-way.
+type midStreamErrorBody struct {
+	chunk string
+	once  bool
+	err   error
+}
+
+func (m *midStreamErrorBody) Read(p []byte) (int, error) {
+	if !m.once {
+		m.once = true
+		return copy(p, m.chunk), nil
+	}
+	return 0, m.err
+}
+
+func (m *midStreamErrorBody) Close() error { return nil }
+
+func TestStreamChatCompletionToAnthropicMidStreamError(t *testing.T) {
+	chunk := `data: {"model":"m","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}` + "\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body: &midStreamErrorBody{
+			chunk: chunk,
+			err:   errors.New("connection reset by peer"),
+		},
+	}
+	rec := httptest.NewRecorder()
+	streamChatCompletionToAnthropic(rec, resp)
+
+	out := rec.Body.String()
+	for _, want := range []string{
+		"message_start",
+		"content_block_delta",
+		"\"text\":\"Hello\"",
+		"content_block_stop",
+		"message_delta",
+		"event: error",
+		"api_error",
+		"message_stop",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mid-stream failure output missing %q:\n%s", want, out)
+		}
+	}
+	// The error SSE event must be emitted before message_stop closes the stream.
+	if iErr, iStop := strings.Index(out, "event: error"), strings.Index(out, "message_stop"); iErr < 0 || iStop < 0 || iErr > iStop {
+		t.Errorf("expected error event before message_stop:\n%s", out)
+	}
+	// No raw Chat Completions chunk JSON should be forwarded as a data: payload.
+	if strings.Contains(out, "finish_reason") {
+		t.Errorf("raw chat completion chunk leaked into stream:\n%s", out)
+	}
+}
+
+func TestHandleMessagesSuccessNonStream(t *testing.T) {
+	// Regression: an upstream 200 non-stream body must be converted to an
+	// Anthropic message envelope (top-level "type":"message"), not passed raw.
+	chat := `{
+		"id": "chatcmpl-abc",
+		"model": "m",
+		"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+	}`
+	rt := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(chat)),
+		}, nil
+	})
+	restore := withStubUpstream(rt)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handleMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var payload struct {
+		Type  string `json:"type"`
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Type != "message" {
+		t.Errorf("type = %q, want message", payload.Type)
+	}
+	if !strings.HasPrefix(payload.ID, "msg_") {
+		t.Errorf("id = %q, want msg_ prefix", payload.ID)
+	}
+	if payload.Model != "m" {
+		t.Errorf("model = %q, want m", payload.Model)
+	}
+}
+
+func TestLogMessagesDiagnosticSmoke(t *testing.T) {
+	// Sanity: the diagnostic logger must not panic and must never embed the API
+	// key. (It simply formats a line via the standard logger.)
+	logMessagesDiagnostic("m", true, 400, "bad upstream", "", 42)
+	logMessagesDiagnostic("m", false, 502, "", "bad conversion", 0)
 }

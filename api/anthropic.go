@@ -305,6 +305,20 @@ func replaceWithAnthropicError(w http.ResponseWriter, resp *http.Response) {
 // request, forwards it to the upstream, and converts the response back to the
 // Anthropic Messages protocol.
 func handleMessages(w http.ResponseWriter, r *http.Request) {
+	// Wrap w to count response bytes for the diagnostics log. The wrapper
+	// forwards Flush so the streaming path keeps flushing to the client.
+	counting := &byteCountWriter{ResponseWriter: w}
+	w = counting
+
+	// Diagnostics facts captured across the handler's various return points and
+	// emitted as a single structured line after the request completes.
+	var diagModel, diagUpErr, diagConvertErr string
+	var diagStream bool
+	var diagUpstream int
+	defer func() {
+		logMessagesDiagnostic(diagModel, diagStream, diagUpstream, diagUpErr, diagConvertErr, counting.n)
+	}()
+
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed; use POST")
@@ -315,6 +329,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "failed to read request body")
 		return
+	}
+
+	// Record the request model (best-effort) for the diagnostics log.
+	var ar anthropicRequest
+	if json.Unmarshal(bodyBytes, &ar) == nil {
+		diagModel = ar.Model
 	}
 
 	chatBody, err := anthropicToChat(bodyBytes)
@@ -344,10 +364,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	diagUpstream = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
 		// Surface upstream errors as Anthropic-style errors, preserving the
-		// status code, rather than passing the raw body verbatim.
+		// status code, rather than passing the raw body verbatim. This runs
+		// before the stream branch below, so a streaming request that fails
+		// upstream with a 4xx still yields a proper {"type":"error",...} JSON.
+		body, _ := readAllCloser(resp.Body)
+		diagUpErr = extractErrorMessage(body)
+		// Re-seat the (consumed) body so replaceWithAnthropicError can write the
+		// envelope; the extracted message feeds the diagnostics log.
+		resp.Body = io.NopCloser(bytes.NewReader(body))
 		replaceWithAnthropicError(w, resp)
 		return
 	}
@@ -359,6 +387,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	if json.Unmarshal(bodyBytes, &p) == nil {
 		isStream = p.Stream
 	}
+	diagStream = isStream
 
 	if isStream {
 		streamChatCompletionToAnthropic(w, resp)
@@ -372,9 +401,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	converted, err := chatCompletionToAnthropic(raw)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(raw)
+		diagConvertErr = err.Error()
+		logf("messages: convert upstream response failed: %v", err)
+		writeAnthropicError(w, http.StatusBadGateway, "failed to convert upstream response: "+err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -436,11 +465,23 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 	sendEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 
 	buf := bufio.NewReaderSize(resp.Body, 4096)
+	var streamErr error
 	for {
 		line, err := buf.ReadString('\n')
+		hard := err != nil && err != io.EOF
 		if err != nil {
 			if line == "" {
+				// Clean end of the upstream stream (EOF) — unless the error is a
+				// hard (non-EOF) failure, in which case this is an abnormal stop.
+				if hard {
+					streamErr = err
+				}
 				break
+			}
+			// Leftover partial line alongside the error: remember a hard failure
+			// but still process the trailing line below.
+			if hard {
+				streamErr = err
 			}
 		}
 		line = strings.TrimSpace(line)
@@ -449,6 +490,8 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			// Stream closed normally.
+			streamErr = nil
 			break
 		}
 
@@ -498,5 +541,47 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 			"output_tokens": outputTokens,
 		},
 	}))
+	if streamErr != nil {
+		// The upstream stream died before a clean [DONE]: surface an Anthropic
+		// `error` SSE event (never raw Chat Completions chunk JSON) so the
+		// client can report the failure, then close cleanly with message_stop.
+		sendEvent("error", mustJSON(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "api_error",
+				"message": "upstream stream failed: " + streamErr.Error(),
+			},
+		}))
+	}
 	sendEvent("message_stop", `{"type":"message_stop"}`)
+}
+
+// byteCountWriter wraps an http.ResponseWriter to count the bytes written out,
+// so handleMessages can record the response size in its diagnostics log. It
+// forwards Flush so it can also wrap the streaming path, which relies on
+// http.Flusher to push SSE events to the client.
+type byteCountWriter struct {
+	http.ResponseWriter
+	n int
+}
+
+func (b *byteCountWriter) Write(p []byte) (int, error) {
+	n, err := b.ResponseWriter.Write(p)
+	b.n += n
+	return n, err
+}
+
+func (b *byteCountWriter) Flush() {
+	if f, ok := b.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// logMessagesDiagnostic emits a single structured diagnostics line for one
+// /v1/messages request: the model, stream flag, upstream status, the extracted
+// upstream error message, conversion-failure detail, and the response byte
+// size. The raw API key is intentionally never logged.
+func logMessagesDiagnostic(model string, stream bool, upstreamStatus int, upErrMsg string, convertErr string, respBytes int) {
+	logf("messages: model=%q stream=%v upstream_status=%d upstream_error=%q convert_error=%q response_bytes=%d",
+		model, stream, upstreamStatus, upErrMsg, convertErr, respBytes)
 }
