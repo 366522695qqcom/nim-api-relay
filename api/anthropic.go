@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -266,6 +265,42 @@ func writeAnthropicError(w http.ResponseWriter, status int, message string) {
 	w.Write(body)
 }
 
+// extractErrorMessage pulls a human-readable message out of an upstream error
+// body. It handles OpenAI/NVIDIA-style {"error":{"message":...}} and
+// Anthropic-style {"error":{"type":...,"message":...}} shapes plus a bare
+// top-level "message", and falls back to the raw body (truncated).
+func extractErrorMessage(body []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	var m struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &m) == nil && m.Message != "" {
+		return m.Message
+	}
+	s := strings.TrimSpace(string(body))
+	if len(s) > 2000 {
+		s = s[:2000]
+	}
+	if s == "" {
+		return "upstream request failed"
+	}
+	return s
+}
+
+// replaceWithAnthropicError reads an upstream non-2xx error body and writes a
+// standard Anthropic-style error response, preserving the upstream status code.
+func replaceWithAnthropicError(w http.ResponseWriter, resp *http.Response) {
+	body, _ := readAllCloser(resp.Body)
+	writeAnthropicError(w, resp.StatusCode, extractErrorMessage(body))
+}
+
 // handleMessages translates a /v1/messages request into a Chat Completions
 // request, forwards it to the upstream, and converts the response back to the
 // Anthropic Messages protocol.
@@ -311,12 +346,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Pass through upstream errors verbatim.
-		removeHopByHopHeaders(resp.Header)
-		copyHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		body, _ := readAllCloser(resp.Body)
-		w.Write(body)
+		// Surface upstream errors as Anthropic-style errors, preserving the
+		// status code, rather than passing the raw body verbatim.
+		replaceWithAnthropicError(w, resp)
 		return
 	}
 
@@ -351,7 +383,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamChatCompletionToAnthropic converts a Chat Completions SSE stream into
-// an Anthropic Messages SSE event stream (message_start … message_stop).
+// an Anthropic Messages SSE event stream (message_start … message_stop). It
+// emits each event incrementally as upstream chunks arrive (rather than
+// buffering the whole stream) so the client sees the first output immediately.
 func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
 
@@ -369,13 +403,38 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 	}
 
 	msgID := anthropicMessageID()
-	var model string
+	// model may be unknown before the first upstream chunk arrives; start with
+	// a placeholder and fill it in as soon as a chunk provides one.
+	model := "unknown"
 	finished := "end_turn"
+	outputTokens := 0
 
-	// Parse the whole stream into text chunks first so we can emit the leading
-	// message_start/content_block_start events (which need model) before the
-	// deltas we actually forward.
-	var textParts []map[string]string
+	mustJSON := func(v interface{}) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+
+	// The lifecycle events are emitted immediately, before reading any upstream
+	// chunk, so that the first byte does not wait for the whole response.
+	sendEvent("message_start", mustJSON(map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            msgID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}))
+
+	sendEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+
 	buf := bufio.NewReaderSize(resp.Body, 4096)
 	for {
 		line, err := buf.ReadString('\n')
@@ -412,7 +471,15 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			if delta.Content != "" {
-				textParts = append(textParts, map[string]string{"text": delta.Content})
+				outputTokens++
+				sendEvent("content_block_delta", mustJSON(map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]interface{}{
+						"type": "text_delta",
+						"text": delta.Content,
+					},
+				}))
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				finished = anthropicStopReason(*chunk.Choices[0].FinishReason)
@@ -420,21 +487,16 @@ func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response)
 		}
 	}
 
-	if model == "" {
-		model = "unknown"
-	}
-	sendEvent("message_start", `{"type":"message_start","message":{`+
-		`"id":`+stringValue(msgID)+`,`+
-		`"type":"message","role":"assistant","model":`+stringValue(model)+`,`+
-		`"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
-
-	sendEvent("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
-
-	for _, d := range textParts {
-		sendEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":`+stringValue(d["text"])+`}}`)
-	}
-
 	sendEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
-	sendEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":`+stringValue(finished)+`},"usage":{"input_tokens":0,"output_tokens":`+strconv.Itoa(len(textParts))+`}}`)
+	sendEvent("message_delta", mustJSON(map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason": finished,
+		},
+		"usage": map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": outputTokens,
+		},
+	}))
 	sendEvent("message_stop", `{"type":"message_stop"}`)
 }

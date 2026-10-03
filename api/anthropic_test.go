@@ -2,6 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -269,5 +272,171 @@ func TestChatCompletionToAnthropicToolCalls(t *testing.T) {
 	input, _ := block["input"].(map[string]interface{})
 	if input["city"] != "beijing" {
 		t.Errorf("tool input = %v", block["input"])
+	}
+}
+
+// chunkSourcedBody is an io.ReadCloser that serves SSE chunks to the stream
+// translator one at a time, blocking until the test releases each chunk. This
+// lets the test assert that the first delta is emitted before any later chunk
+// is made available.
+type chunkSourcedBody struct {
+	firstEntered  chan struct{}
+	firstRelease  chan struct{}
+	secondEntered chan struct{}
+	secondRelease chan struct{}
+	chunk1, chunk2 string
+	calls          int
+}
+
+func (c *chunkSourcedBody) Read(p []byte) (int, error) {
+	c.calls++
+	switch c.calls {
+	case 1:
+		close(c.firstEntered)
+		<-c.firstRelease
+		return copy(p, c.chunk1), nil
+	case 2:
+		close(c.secondEntered)
+		<-c.secondRelease
+		return copy(p, c.chunk2), nil
+	default:
+		return 0, io.EOF
+	}
+}
+
+func (c *chunkSourcedBody) Close() error { return nil }
+
+func TestStreamChatCompletionToAnthropicIncremental(t *testing.T) {
+	chunk1 := "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n"
+	chunk2 := "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"World\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	body := &chunkSourcedBody{
+		firstEntered:  make(chan struct{}),
+		firstRelease:  make(chan struct{}),
+		secondEntered: make(chan struct{}),
+		secondRelease: make(chan struct{}),
+		chunk1:        chunk1,
+		chunk2:        chunk2,
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       body,
+	}
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamChatCompletionToAnthropic(rec, resp)
+	}()
+
+	// The translator emits message_start + content_block_start before reading
+	// any upstream chunk. Wait until it blocks on the first read, then assert
+	// the leading events are already present.
+	<-body.firstEntered
+	early := rec.Body.String()
+	if !strings.Contains(early, "\"message_start\"") {
+		t.Errorf("message_start not emitted before any upstream chunk:\n%s", early)
+	}
+	if !strings.Contains(early, "\"content_block_start\"") {
+		t.Errorf("content_block_start not emitted before any upstream chunk:\n%s", early)
+	}
+
+	// Release chunk1 and wait until the translator requests chunk2. By then it
+	// must already have processed chunk1 and emitted its content_block_delta.
+	close(body.firstRelease)
+	<-body.secondEntered
+	afterFirst := rec.Body.String()
+	if !strings.Contains(afterFirst, "\"text\":\"Hello\"") {
+		t.Errorf("first content_block_delta not emitted before chunk2 was read:\n%s", afterFirst)
+	}
+
+	// Release chunk2 + [DONE] and wait for the stream to finish.
+	close(body.secondRelease)
+	<-done
+	final := rec.Body.String()
+	for _, want := range []string{
+		"\"content_block_stop\"",
+		"\"message_delta\"",
+		"\"stop_reason\":\"end_turn\"",
+		"\"message_stop\"",
+	} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final stream missing %s:\n%s", want, final)
+		}
+	}
+	if !strings.Contains(final, "\"text\":\"World\"") {
+		t.Errorf("second content_block_delta missing from final stream:\n%s", final)
+	}
+}
+
+func TestExtractErrorMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "openai-style",
+			body: `{"error":{"message":"The model meta/does-not-exist does not exist","type":"invalid_request_error"}}`,
+			want: "The model meta/does-not-exist does not exist",
+		},
+		{
+			name: "anthropic-style",
+			body: `{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}`,
+			want: "bad model",
+		},
+		{
+			name: "bare-message",
+			body: `{"message":"simple error"}`,
+			want: "simple error",
+		},
+		{
+			name: "unparseable-fallback",
+			body: `not json at all`,
+			want: "not json at all",
+		},
+		{
+			name: "empty-fallback",
+			body: `  `,
+			want: "upstream request failed",
+		},
+	}
+	for _, c := range cases {
+		if got := extractErrorMessage([]byte(c.body)); got != c.want {
+			t.Errorf("%s: extractErrorMessage = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestWriteAnthropicError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeAnthropicError(rec, http.StatusBadRequest, "The model meta/does-not-exist does not exist")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal error body: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Errorf("type = %q, want error", resp.Type)
+	}
+	if resp.Error.Type != "invalid_request_error" {
+		t.Errorf("error.type = %q", resp.Error.Type)
+	}
+	if resp.Error.Message != "The model meta/does-not-exist does not exist" {
+		t.Errorf("error.message = %q", resp.Error.Message)
 	}
 }
