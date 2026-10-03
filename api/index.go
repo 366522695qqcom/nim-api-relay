@@ -227,6 +227,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Anthropic SDKs/tools (Claude Code, etc.) speak the Messages API. Translate
+	// it to the Chat Completions protocol the upstream understands.
+	if isAnthropicMessagesPath(r.URL.Path) {
+		handleMessages(w, r)
+		return
+	}
+
 	target := upstreamURL()
 
 	var bodyBytes []byte
