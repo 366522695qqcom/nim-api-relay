@@ -30,36 +30,50 @@ type requestLog struct {
 	start   time.Time
 }
 
-// clientIP returns the best-effort client IP: the first X-Forwarded-For entry
-// (set by Vercel/CDN) falling back to the socket address.
+// maxInspectBytes bounds how much of a request body extractModel will buffer.
+// Larger payloads skip model extraction so relaying them costs no extra memory.
+const maxInspectBytes = 1 << 20 // 1 MiB
+
+// clientIP returns the best-effort client IP. Proxy chains append the address
+// they observed, so the LAST valid X-Forwarded-For entry is the most trustworthy
+// one; a client can only prepend addresses, not append. Entries that are not
+// valid IPs are ignored.
 func clientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if i := strings.IndexByte(xff, ','); i != -1 {
-			xff = xff[:i]
-		}
-		if ip := strings.TrimSpace(xff); ip != "" {
-			return ip
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	return strings.TrimSpace(host)
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	if host == "" {
+		return "unknown"
+	}
+	return host
 }
 
-// extractModel lazily reads a "model" field from the request body without
-// consuming the body, restoring it for downstream handling.
+// extractModel reads a "model" field from the request body without consuming
+// it. Bodies larger than maxInspectBytes are left untouched (the field is
+// omitted from the log) to avoid buffering big payloads twice.
 func extractModel(r *http.Request) string {
-	if r.Body == nil {
+	if r.Body == nil || r.ContentLength < 0 || r.ContentLength > maxInspectBytes {
 		return ""
 	}
-	body, _ := readBody(r)
-	if len(body) == 0 {
-		return ""
-	}
+	body, err := readBody(r)
 	// Restore the body so downstream reading still sees it.
 	r.Body = newReadCloser(body)
+	if err != nil || len(body) == 0 {
+		return ""
+	}
 	var p struct {
 		Model string `json:"model"`
 	}

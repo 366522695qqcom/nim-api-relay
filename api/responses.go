@@ -23,29 +23,19 @@ func trimSlash(s string) string {
 	return strings.Trim(s, "/")
 }
 
-// copyHeaders copies all headers from src to dst.
-func copyHeaders(dst, src http.Header) {
-	for k, vs := range src {
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
-}
-
-// copyStreamHeaders copies SSE + pass-through headers for a translated stream,
-// dropping hop-by-hop headers and any content-length set by the upstream.
+// copyStreamHeaders prepares SSE response headers for a translated stream.
+// Only safe cache/retry hints are taken from the upstream; everything else
+// (cookies, CSP, custom headers) is dropped.
 func copyStreamHeaders(dst, src http.Header) {
 	removeHopByHopHeaders(src)
-	for k, vs := range src {
-		if strings.EqualFold(k, "Content-Length") {
-			continue
-		}
-		for _, v := range vs {
+	for _, k := range []string{"Retry-After"} {
+		for _, v := range src.Values(k) {
 			dst.Add(k, v)
 		}
 	}
 	dst.Set("Content-Type", "text/event-stream")
 	dst.Set("Cache-Control", "no-cache")
+	dst.Del("Content-Length")
 	dst.Del("Transfer-Encoding")
 }
 
@@ -150,11 +140,89 @@ func responsesToChat(input []byte) ([]byte, error) {
 		chat["top_p"] = *rb.TopP
 	}
 	setRawField(chat, "stop", rb.Stop)
-	setRawField(chat, "tools", rb.Tools)
-	setRawField(chat, "tool_choice", rb.ToolChoice)
+	if tools := responsesToolsToChat(rb.Tools); tools != nil {
+		chat["tools"] = tools
+	}
+	if tc := responsesToolChoiceToChat(rb.ToolChoice); tc != nil {
+		chat["tool_choice"] = tc
+	}
 	setRawField(chat, "response_format", rb.ResponseFormat)
 
 	return json.Marshal(chat)
+}
+
+// responsesToolsToChat converts Responses API tool definitions into the Chat
+// Completions function schema. Responses uses a flat shape
+// ({"type":"function","name":…,"parameters":…}) while Chat Completions nests it
+// under "function"; passing the flat form through makes the upstream ignore
+// the tools entirely. Non-function tools (web_search, file_search, …) have no
+// Chat Completions equivalent and are dropped.
+func responsesToolsToChat(raw json.RawMessage) interface{} {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var tools []map[string]interface{}
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(tools))
+	for _, t := range tools {
+		if typ, _ := t["type"].(string); typ != "function" {
+			continue
+		}
+		name, _ := t["name"].(string)
+		if name == "" {
+			continue
+		}
+		fn := map[string]interface{}{"name": name}
+		if desc, ok := t["description"]; ok {
+			fn["description"] = desc
+		}
+		if params, ok := t["parameters"]; ok {
+			fn["parameters"] = params
+		} else {
+			fn["parameters"] = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+		}
+		if strict, ok := t["strict"]; ok {
+			fn["strict"] = strict
+		}
+		out = append(out, map[string]interface{}{"type": "function", "function": fn})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// responsesToolChoiceToChat converts the Responses tool_choice value ("auto",
+// "none", "required", or {"type":"function","name":…}) into its Chat
+// Completions equivalent.
+func responsesToolChoiceToChat(raw json.RawMessage) interface{} {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		switch s {
+		case "auto", "none", "required":
+			return s
+		}
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	if obj.Type == "function" && obj.Name != "" {
+		return map[string]interface{}{
+			"type":     "function",
+			"function": map[string]interface{}{"name": obj.Name},
+		}
+	}
+	return nil
 }
 
 // setRawField copies a still-encoded JSON value into a target map if non-empty.
@@ -216,40 +284,27 @@ func chatCompletionToResponse(in []byte) ([]byte, error) {
 	switch ch.FinishReason {
 	case "length", "max_tokens":
 		resp["status"] = "incomplete"
-	case "tool_calls", "function_call":
-		resp["status"] = "in_progress"
 	}
 
 	var output []interface{}
 
 	text := contentToString(ch.Message.Content)
-	contentParts := []interface{}{
-		map[string]interface{}{
-			"type":        "output_text",
-			"text":        text,
-			"annotations": []interface{}{},
-		},
-	}
-
-	// Surface reasoning text, if the upstream model provided it.
-	if ch.Message.ReasoningContent != "" {
+	itemID := "msg_" + strings.TrimPrefix(co.ID, "chatcmpl-")
+	if text != "" || len(ch.Message.ToolCalls) == 0 {
 		output = append(output, map[string]interface{}{
-			"type":  "function_call",
-			"id":    "reasoning_" + co.ID,
-			"name":  "reasoning",
-			"arguments": fmt.Sprintf(
-				`{"summary":[{"type":"summary_text","text":%q}]}`, ch.Message.ReasoningContent),
+			"type":   "message",
+			"id":     itemID,
+			"status": "completed",
+			"role":   "assistant",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type":        "output_text",
+					"text":        text,
+					"annotations": []interface{}{},
+				},
+			},
 		})
 	}
-
-	itemID := "msg_" + strings.TrimPrefix(co.ID, "chatcmpl-")
-	output = append(output, map[string]interface{}{
-		"type":   "message",
-		"id":     itemID,
-		"status": "completed",
-		"role":   "assistant",
-		"content": contentParts,
-	})
 
 	for _, tc := range ch.Message.ToolCalls {
 		var call map[string]interface{}
@@ -322,6 +377,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeBodyTooLarge(w, r.URL.Path)
+			return
+		}
 		writeRelayError(w, http.StatusBadGateway, "failed to read request body")
 		return
 	}
@@ -349,9 +408,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Pass through upstream errors verbatim.
+		// Pass through upstream errors, but only whitelisted headers.
 		removeHopByHopHeaders(resp.Header)
-		copyHeaders(w.Header(), resp.Header)
+		copySafeHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		body, _ := readAllCloser(resp.Body)
 		w.Write(body)
@@ -388,8 +447,21 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	w.Write(converted)
 }
 
+// respToolState tracks one streamed tool call and the Responses output item
+// allocated for it.
+type respToolState struct {
+	outputIndex int
+	itemID      string
+	callID      string
+	name        string
+	pending     strings.Builder
+	args        strings.Builder
+	started     bool
+}
+
 // streamChatCompletionToResponses converts a Chat Completions SSE stream into a
-// Responses API SSE event stream.
+// Responses API SSE event stream, including function_call items for streamed
+// tool calls.
 func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
 
@@ -398,56 +470,146 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 	w.WriteHeader(resp.StatusCode)
 
 	respID := "resp_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	itemID := "item_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	messageItemID := "msg_" + fmt.Sprintf("%d", time.Now().UnixNano())
 	createdAt := time.Now().Unix()
+
 	var model string
 	var text strings.Builder
-	var reasoning strings.Builder
+	var inputTokens, outputTokens int
+	finished := ""
 
-	sendEvent := func(event, data string) {
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	// Output items are assigned indices in the order they first appear.
+	nextIndex := 0
+	textIndex := -1
+	textOpen := false
+	tools := map[int]*respToolState{}
+	toolOrder := []int{}
+
+	emit := func(event string, payload map[string]interface{}) {
+		payload["type"] = event
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
 
-	// Session lifecycle events.
-	responseObj := func(status string) string {
-		b, _ := json.Marshal(map[string]interface{}{
+	responseObj := func(status string, output []interface{}) map[string]interface{} {
+		return map[string]interface{}{
 			"id":         respID,
 			"object":     "response",
 			"created_at": createdAt,
 			"status":     status,
 			"model":      model,
-			"output":     []interface{}{},
-		})
-		return string(b)
+			"output":     output,
+			"usage": map[string]interface{}{
+				"input_tokens":  inputTokens,
+				"output_tokens": outputTokens,
+				"total_tokens":  inputTokens + outputTokens,
+			},
+		}
 	}
-	messageItem := func(status, fullText string) string {
-		b, _ := json.Marshal(map[string]interface{}{
-			"id":     itemID,
+
+	messageItem := func(status, fullText string) map[string]interface{} {
+		return map[string]interface{}{
+			"id":     messageItemID,
 			"type":   "message",
 			"status": status,
 			"role":   "assistant",
 			"content": []interface{}{map[string]interface{}{
 				"type": "output_text", "text": fullText, "annotations": []interface{}{},
 			}},
-		})
-		return string(b)
+		}
 	}
 
-	sendEvent("response.created", `{"type":"response.created","response":`+responseObj("in_progress")+`}`)
-	sendEvent("response.in_progress", `{"type":"response.in_progress","response":`+responseObj("in_progress")+`}`)
-	sendEvent("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":`+messageItem("in_progress", "")+`}`)
-	sendEvent("response.content_part.added", `{"type":"response.content_part.added","item_id":"`+itemID+`","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`)
+	startText := func() {
+		if textOpen {
+			return
+		}
+		textOpen = true
+		textIndex = nextIndex
+		nextIndex++
+		emit("response.output_item.added", map[string]interface{}{
+			"output_index": textIndex,
+			"item":         messageItem("in_progress", ""),
+		})
+		emit("response.content_part.added", map[string]interface{}{
+			"item_id":       messageItemID,
+			"output_index":  textIndex,
+			"content_index": 0,
+			"part":          map[string]interface{}{"type": "output_text", "text": "", "annotations": []interface{}{}},
+		})
+	}
+
+	emitTextDelta := func(delta string) {
+		startText()
+		text.WriteString(delta)
+		emit("response.output_text.delta", map[string]interface{}{
+			"item_id":       messageItemID,
+			"output_index":  textIndex,
+			"content_index": 0,
+			"delta":         delta,
+		})
+	}
+
+	// addTool opens the function_call output item once id and name are known.
+	addTool := func(st *respToolState) bool {
+		if st.started || st.name == "" || st.callID == "" {
+			return st.started
+		}
+		st.outputIndex = nextIndex
+		nextIndex++
+		st.started = true
+		if st.itemID == "" {
+			st.itemID = "fc_" + st.callID
+		}
+		emit("response.output_item.added", map[string]interface{}{
+			"output_index": st.outputIndex,
+			"item": map[string]interface{}{
+				"id":        st.itemID,
+				"type":      "function_call",
+				"status":    "in_progress",
+				"call_id":   st.callID,
+				"name":      st.name,
+				"arguments": "",
+			},
+		})
+		return true
+	}
+
+	emitArgs := func(st *respToolState, delta string) {
+		if delta == "" {
+			return
+		}
+		st.args.WriteString(delta)
+		emit("response.function_call_arguments.delta", map[string]interface{}{
+			"item_id":      st.itemID,
+			"output_index": st.outputIndex,
+			"delta":        delta,
+		})
+	}
+
+	emit("response.created", map[string]interface{}{
+		"response": responseObj("in_progress", []interface{}{}),
+	})
+	emit("response.in_progress", map[string]interface{}{
+		"response": responseObj("in_progress", []interface{}{}),
+	})
 
 	buf := bufio.NewReaderSize(resp.Body, 4096)
-	finished := ""
+	streamErr := ""
 	for {
 		line, err := buf.ReadString('\n')
+		hard := err != nil && err != io.EOF
 		if err != nil {
 			if line == "" {
+				if hard {
+					streamErr = err.Error()
+				}
 				break
+			}
+			if hard {
+				streamErr = err.Error()
 			}
 		}
 		line = strings.TrimSpace(line)
@@ -456,6 +618,7 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			streamErr = ""
 			break
 		}
 
@@ -466,6 +629,14 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 				Delta struct {
 					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -476,8 +647,6 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			emitRaw := `{"type":"response.output_text.delta","delta":` + stringValue(data) + `}`
-			sendEvent("response.output_text.delta", emitRaw)
 			continue
 		}
 
@@ -487,37 +656,117 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 		if chunk.Model != "" {
 			model = chunk.Model
 		}
+		if chunk.Usage != nil {
+			if chunk.Usage.PromptTokens > 0 {
+				inputTokens = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens > 0 {
+				outputTokens = chunk.Usage.CompletionTokens
+			}
+		}
 
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			if delta.ReasoningContent != "" {
-				reasoning.WriteString(delta.ReasoningContent)
-				sendEvent("response.output_text.delta", `{"type":"response.output_text.delta","item_id":"`+itemID+`","output_index":0,"content_index":0,"delta":`+stringValue(reasoning.String())+`}`)
-			} else if delta.Content != "" {
-				text.WriteString(delta.Content)
-				sendEvent("response.output_text.delta", `{"type":"response.output_text.delta","item_id":"`+itemID+`","output_index":0,"content_index":0,"delta":`+stringValue(delta.Content)+`}`)
+				emitTextDelta(delta.ReasoningContent)
+			}
+			if delta.Content != "" {
+				emitTextDelta(delta.Content)
+			}
+			for _, tc := range delta.ToolCalls {
+				st := tools[tc.Index]
+				if st == nil {
+					st = &respToolState{}
+					tools[tc.Index] = st
+					toolOrder = append(toolOrder, tc.Index)
+				}
+				if tc.ID != "" {
+					st.callID = tc.ID
+				}
+				if tc.Function.Name != "" {
+					st.name = tc.Function.Name
+				}
+				wasStarted := st.started
+				if addTool(st) {
+					if !wasStarted {
+						// Flush arguments buffered before id/name arrived.
+						if pending := st.pending.String(); pending != "" {
+							st.pending.Reset()
+							emitArgs(st, pending)
+						}
+					}
+					emitArgs(st, tc.Function.Arguments)
+				} else {
+					// Arguments can precede id/name; buffer until the item opens.
+					st.pending.WriteString(tc.Function.Arguments)
+				}
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				finished = *chunk.Choices[0].FinishReason
 			}
 		}
-
-		if chunk.Usage != nil {
-			if finished == "" {
-				finished = "stop"
-			}
-		}
 	}
 
-	fullText := text.String()
-	sendEvent("response.output_text.done", `{"type":"response.output_text.done","item_id":"`+itemID+`","output_index":0,"content_index":0,"text":`+stringValue(fullText)+`,"annotations":[]}`)
-	sendEvent("response.output_item.done", `{"type":"response.output_item.done","output_index":0,"item":`+messageItem("completed", fullText)+`}`)
+	// Close open items in output order.
+	var output []interface{}
+	if textOpen {
+		emit("response.output_text.done", map[string]interface{}{
+			"item_id":       messageItemID,
+			"output_index":  textIndex,
+			"content_index": 0,
+			"text":          text.String(),
+			"annotations":   []interface{}{},
+		})
+		item := messageItem("completed", text.String())
+		emit("response.output_item.done", map[string]interface{}{
+			"output_index": textIndex,
+			"item":         item,
+		})
+		output = append(output, item)
+	}
+	for _, idx := range toolOrder {
+		st := tools[idx]
+		if st == nil {
+			continue
+		}
+		if !st.started {
+			// Never saw both id and name; there is no item to attach the
+			// buffered arguments to.
+			continue
+		}
+		emit("response.function_call_arguments.done", map[string]interface{}{
+			"item_id":      st.itemID,
+			"output_index": st.outputIndex,
+			"arguments":    st.args.String(),
+		})
+		item := map[string]interface{}{
+			"id":        st.itemID,
+			"type":      "function_call",
+			"status":    "completed",
+			"call_id":   st.callID,
+			"name":      st.name,
+			"arguments": st.args.String(),
+		}
+		emit("response.output_item.done", map[string]interface{}{
+			"output_index": st.outputIndex,
+			"item":         item,
+		})
+		output = append(output, item)
+	}
 
 	status := "completed"
 	if finished == "length" || finished == "max_tokens" {
 		status = "incomplete"
 	}
-	sendEvent("response.completed", `{"type":"response.completed","response":`+responseObj(status)+`}`)
+	if streamErr != "" {
+		emit("response.failed", map[string]interface{}{
+			"response": responseObj("failed", output),
+		})
+		return
+	}
+	emit("response.completed", map[string]interface{}{
+		"response": responseObj(status, output),
+	})
 }
 
 // readBody reads and closes the request body.

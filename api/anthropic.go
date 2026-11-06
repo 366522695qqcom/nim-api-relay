@@ -632,6 +632,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := readBody(r)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeBodyTooLarge(w, r.URL.Path)
+			return
+		}
 		writeAnthropicError(w, http.StatusBadGateway, "failed to read request body")
 		return
 	}

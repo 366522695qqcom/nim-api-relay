@@ -67,12 +67,14 @@ func TestResponsesToChat_ArrayInput(t *testing.T) {
 	}
 }
 
-func TestResponsesToChat_ToolsPassThrough(t *testing.T) {
+func TestResponsesToChat_ToolsConversion(t *testing.T) {
+	// Responses tools are flat (name/parameters at the top level); Chat
+	// Completions requires the function wrapper.
 	in := []byte(`{
 		"model": "m",
 		"input": "hi",
-		"tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
-		"tool_choice": "auto"
+		"tools": [{"type": "function", "name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}],
+		"tool_choice": {"type": "function", "name": "f"}
 	}`)
 	out, err := responsesToChat(in)
 	if err != nil {
@@ -82,10 +84,24 @@ func TestResponsesToChat_ToolsPassThrough(t *testing.T) {
 	if err := json.Unmarshal(out, &chat); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if _, ok := chat["tools"]; !ok {
-		t.Errorf("tools not passed through")
+	tools, ok := chat["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", chat["tools"])
 	}
-	if chat["tool_choice"] != "auto" {
+	tool := tools[0].(map[string]interface{})
+	if tool["type"] != "function" {
+		t.Errorf("tools[0].type = %v, want function", tool["type"])
+	}
+	fn, _ := tool["function"].(map[string]interface{})
+	if fn["name"] != "f" || fn["description"] != "d" {
+		t.Errorf("function = %v", fn)
+	}
+	if _, ok := fn["parameters"].(map[string]interface{}); !ok {
+		t.Errorf("parameters not nested under function: %v", fn)
+	}
+	tc, _ := chat["tool_choice"].(map[string]interface{})
+	fnChoice, _ := tc["function"].(map[string]interface{})
+	if tc["type"] != "function" || fnChoice["name"] != "f" {
 		t.Errorf("tool_choice = %v", chat["tool_choice"])
 	}
 }

@@ -101,17 +101,42 @@ func (s *redisStore) pipeline(cmds [][]interface{}) error {
 	return nil
 }
 
+// dailyKey returns a per-day hash key. Per-IP/per-Key counters are bucketed by
+// UTC day and expired, so spoofed or high-cardinality values cannot grow the
+// hashes without bound.
+func dailyKey(prefix string) string {
+	return prefix + ":" + time.Now().UTC().Format("20060102")
+}
+
+// statsTTLSeconds keeps the current bucket long enough to survive a timezone
+// rollover plus a day of viewing.
+const statsTTLSeconds = 172800 // 48h
+
 func (s *redisStore) Record(e LogEntry) error {
 	entry, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
+	ip := strings.TrimSpace(e.IP)
+	if ip == "" {
+		ip = "unknown"
+	}
+	if len(ip) > 45 {
+		ip = ip[:45]
+	}
+	ipKey := dailyKey("relay:byip")
+	keyKey := dailyKey("relay:bykey")
+
 	cmds := [][]interface{}{
 		{"INCR", "relay:total"},
-		{"HINCRBY", "relay:byip", e.IP, 1},
+		{"HINCRBY", ipKey, ip, 1},
+		{"EXPIRE", ipKey, statsTTLSeconds},
 	}
 	if e.KeyMask != "" {
-		cmds = append(cmds, []interface{}{"HINCRBY", "relay:bykey", e.KeyMask, 1})
+		cmds = append(cmds,
+			[]interface{}{"HINCRBY", keyKey, e.KeyMask, 1},
+			[]interface{}{"EXPIRE", keyKey, statsTTLSeconds},
+		)
 	}
 	cmds = append(cmds,
 		[]interface{}{"LPUSH", "relay:logs", string(entry)},
@@ -170,14 +195,14 @@ func (s *redisStore) Stats() (Stats, []LogEntry, error) {
 	st.Total = int64(total)
 
 	var flat []string
-	if err := s.cmd("HGETALL", []string{"relay:byip"}, &flat); err == nil {
+	if err := s.cmd("HGETALL", []string{dailyKey("relay:byip")}, &flat); err == nil {
 		for i := 0; i+1 < len(flat); i += 2 {
 			var v float64
 			_ = json.Unmarshal([]byte(flat[i+1]), &v)
 			st.ByIP[flat[i]] = int64(v)
 		}
 	}
-	if err := s.cmd("HGETALL", []string{"relay:bykey"}, &flat); err == nil {
+	if err := s.cmd("HGETALL", []string{dailyKey("relay:bykey")}, &flat); err == nil {
 		for i := 0; i+1 < len(flat); i += 2 {
 			var v float64
 			_ = json.Unmarshal([]byte(flat[i+1]), &v)
