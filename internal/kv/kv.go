@@ -112,18 +112,25 @@ func dailyKey(prefix string) string {
 // rollover plus a day of viewing.
 const statsTTLSeconds = 172800 // 48h
 
+// sanitizedIP bounds the IP field so a malformed header cannot bloat a hash
+// field.
+func sanitizedIP(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return "unknown"
+	}
+	if len(ip) > 45 {
+		return ip[:45]
+	}
+	return ip
+}
+
 func (s *redisStore) Record(e LogEntry) error {
 	entry, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	ip := strings.TrimSpace(e.IP)
-	if ip == "" {
-		ip = "unknown"
-	}
-	if len(ip) > 45 {
-		ip = ip[:45]
-	}
+	ip := sanitizedIP(e.IP)
 	ipKey := dailyKey("relay:byip")
 	keyKey := dailyKey("relay:bykey")
 
