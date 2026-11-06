@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -99,6 +100,218 @@ func anthropicContentToChat(content interface{}) interface{} {
 	}
 }
 
+// mappedModel translates a client-supplied model name into the upstream NIM
+// model id. MODEL_MAP holds comma/semicolon/newline separated "from=to" pairs;
+// DEFAULT_MODEL is the fallback for any claude-* name without an explicit entry.
+// Unknown names pass through unchanged.
+func mappedModel(model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return m
+	}
+	for _, pair := range strings.FieldsFunc(os.Getenv("MODEL_MAP"), func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n'
+	}) {
+		k, v, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k), m) {
+			if to := strings.TrimSpace(v); to != "" {
+				return to
+			}
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(m), "claude") {
+		if def := strings.TrimSpace(os.Getenv("DEFAULT_MODEL")); def != "" {
+			return def
+		}
+	}
+	return m
+}
+
+// anthropicToolResultText flattens a tool_result `content` value (a string or
+// an array of text blocks) into plain text.
+func anthropicToolResultText(v interface{}) string {
+	switch c := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return c
+	case []interface{}:
+		var sb strings.Builder
+		for _, p := range c {
+			m, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := m["type"].(string); t == "text" || t == "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(stringValue(m["text"]))
+			}
+		}
+		return sb.String()
+	default:
+		return stringOrJSON(c)
+	}
+}
+
+// anthropicContentPartToChat converts a non-text Anthropic content block such
+// as an image into the Chat Completions equivalent.
+func anthropicContentPartToChat(m map[string]interface{}) (interface{}, bool) {
+	switch t, _ := m["type"].(string); t {
+	case "image":
+		src, ok := m["source"].(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		switch st, _ := src["type"].(string); st {
+		case "base64":
+			media, _ := src["media_type"].(string)
+			data, _ := src["data"].(string)
+			if data == "" {
+				return nil, false
+			}
+			if media == "" {
+				media = "image/png"
+			}
+			return map[string]interface{}{
+				"type":      "image_url",
+				"image_url": map[string]interface{}{"url": "data:" + media + ";base64," + data},
+			}, true
+		case "url":
+			if u, _ := src["url"].(string); u != "" {
+				return map[string]interface{}{
+					"type":      "image_url",
+					"image_url": map[string]interface{}{"url": u},
+				}, true
+			}
+		}
+		return nil, false
+	case "image_url":
+		return m, true
+	}
+	return nil, false
+}
+
+// anthropicAssistantMessage maps one Anthropic assistant message into a Chat
+// Completions assistant message, turning tool_use blocks into tool_calls.
+func anthropicAssistantMessage(content interface{}) map[string]interface{} {
+	msg := map[string]interface{}{"role": "assistant"}
+	if s, ok := content.(string); ok {
+		msg["content"] = s
+		return msg
+	}
+	blocks, ok := content.([]interface{})
+	if !ok {
+		msg["content"] = anthropicContentToChat(content)
+		return msg
+	}
+	var text strings.Builder
+	var calls []interface{}
+	for _, p := range blocks {
+		m, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch t, _ := m["type"].(string); t {
+		case "tool_use":
+			args, err := json.Marshal(m["input"])
+			if err != nil || len(args) == 0 || string(args) == "null" {
+				args = []byte("{}")
+			}
+			calls = append(calls, map[string]interface{}{
+				"id":   stringValue(m["id"]),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      stringValue(m["name"]),
+					"arguments": string(args),
+				},
+			})
+		case "text", "":
+			text.WriteString(stringValue(m["text"]))
+		}
+	}
+	msg["content"] = text.String()
+	if len(calls) > 0 {
+		msg["tool_calls"] = calls
+	}
+	return msg
+}
+
+// anthropicUserMessages maps one Anthropic user message into zero or more Chat
+// Completions messages: tool_result blocks become role:"tool" messages, while
+// text/image blocks become a user message. A single Anthropic message can
+// therefore expand into several OpenAI messages.
+func anthropicUserMessages(content interface{}) []map[string]interface{} {
+	if s, ok := content.(string); ok {
+		return []map[string]interface{}{{"role": "user", "content": s}}
+	}
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return []map[string]interface{}{{"role": "user", "content": anthropicContentToChat(content)}}
+	}
+
+	var out []map[string]interface{}
+	var text strings.Builder
+	var parts []interface{}
+	hasText := false
+	flush := func() {
+		if !hasText && len(parts) == 0 {
+			return
+		}
+		var c interface{}
+		if len(parts) == 0 {
+			c = text.String()
+		} else {
+			if hasText {
+				parts = append([]interface{}{
+					map[string]interface{}{"type": "text", "text": text.String()},
+				}, parts...)
+			}
+			c = parts
+		}
+		out = append(out, map[string]interface{}{"role": "user", "content": c})
+		text.Reset()
+		hasText = false
+		parts = nil
+	}
+
+	for _, p := range blocks {
+		m, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch t, _ := m["type"].(string); t {
+		case "tool_result":
+			flush()
+			txt := anthropicToolResultText(m["content"])
+			if isErr, _ := m["is_error"].(bool); isErr && txt != "" {
+				txt = "Error: " + txt
+			}
+			out = append(out, map[string]interface{}{
+				"role":         "tool",
+				"tool_call_id": stringValue(m["tool_use_id"]),
+				"content":      txt,
+			})
+		case "text", "":
+			text.WriteString(stringValue(m["text"]))
+			hasText = true
+		default:
+			if part, ok := anthropicContentPartToChat(m); ok {
+				parts = append(parts, part)
+			}
+		}
+	}
+	flush()
+	if len(out) == 0 {
+		out = append(out, map[string]interface{}{"role": "user", "content": ""})
+	}
+	return out
+}
+
 // anthropicMessagesToChat maps Anthropic `messages` (each with role
 // user/assistant and a string or array content) to Chat Completions messages.
 func anthropicMessagesToChat(in json.RawMessage) ([]map[string]interface{}, error) {
@@ -111,12 +324,100 @@ func anthropicMessagesToChat(in json.RawMessage) ([]map[string]interface{}, erro
 	}
 	out := make([]map[string]interface{}, 0, len(arr))
 	for _, m := range arr {
-		out = append(out, map[string]interface{}{
-			"role":    m.Role,
-			"content": anthropicContentToChat(m.Content),
-		})
+		switch m.Role {
+		case "assistant":
+			out = append(out, anthropicAssistantMessage(m.Content))
+		case "user", "":
+			out = append(out, anthropicUserMessages(m.Content)...)
+		default:
+			out = append(out, map[string]interface{}{
+				"role":    m.Role,
+				"content": stringValue(m.Content),
+			})
+		}
 	}
 	return out, nil
+}
+
+// anthropicToolsToChat converts Anthropic tool definitions
+// ({name,description,input_schema}) into OpenAI function tools
+// ({type:"function",function:{...}}). Already-OpenAI-shaped entries pass through.
+func anthropicToolsToChat(raw json.RawMessage) interface{} {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var arr []map[string]interface{}
+	if json.Unmarshal(raw, &arr) != nil || len(arr) == 0 {
+		return nil
+	}
+	out := make([]interface{}, 0, len(arr))
+	for _, t := range arr {
+		if typ, _ := t["type"].(string); typ == "function" {
+			out = append(out, t)
+			continue
+		}
+		name, _ := t["name"].(string)
+		if name == "" {
+			continue
+		}
+		fn := map[string]interface{}{"name": name}
+		if d, _ := t["description"].(string); d != "" {
+			fn["description"] = d
+		}
+		params := t["input_schema"]
+		if _, ok := params.(map[string]interface{}); !ok {
+			params = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+		}
+		fn["parameters"] = params
+		out = append(out, map[string]interface{}{"type": "function", "function": fn})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// anthropicToolChoiceToChat converts Anthropic tool_choice into the OpenAI form:
+// auto → "auto", any → "required", none → omitted, tool → named function.
+func anthropicToolChoiceToChat(raw json.RawMessage) interface{} {
+	trim := bytes.TrimSpace(raw)
+	if len(trim) == 0 || bytes.Equal(trim, []byte("null")) {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(trim, &s) == nil {
+		switch s {
+		case "auto":
+			return "auto"
+		case "any", "required":
+			return "required"
+		case "none":
+			return nil
+		}
+		return s
+	}
+	var o map[string]interface{}
+	if json.Unmarshal(trim, &o) == nil {
+		if _, ok := o["function"]; ok {
+			return o
+		}
+		switch typ, _ := o["type"].(string); typ {
+		case "auto":
+			return "auto"
+		case "any", "required":
+			return "required"
+		case "none":
+			return nil
+		case "tool":
+			if name, _ := o["name"].(string); name != "" {
+				return map[string]interface{}{
+					"type":     "function",
+					"function": map[string]interface{}{"name": name},
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // anthropicToChat translates an Anthropic Messages request body into a Chat
@@ -127,7 +428,7 @@ func anthropicToChat(input []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	chat := map[string]interface{}{"model": ar.Model}
+	chat := map[string]interface{}{"model": mappedModel(ar.Model)}
 
 	messages := make([]map[string]interface{}, 0, 4)
 	if sys := anthropicSystemText(ar.System); sys != "" {
@@ -149,8 +450,12 @@ func anthropicToChat(input []byte) ([]byte, error) {
 	if ar.TopP != nil {
 		chat["top_p"] = *ar.TopP
 	}
-	setRawField(chat, "tools", ar.Tools)
-	setRawField(chat, "tool_choice", ar.ToolChoice)
+	if tools := anthropicToolsToChat(ar.Tools); tools != nil {
+		chat["tools"] = tools
+	}
+	if tc := anthropicToolChoiceToChat(ar.ToolChoice); tc != nil {
+		chat["tool_choice"] = tc
+	}
 	setRawField(chat, "stop", ar.StopSequences)
 	if ar.Stream {
 		chat["stream"] = true
@@ -235,13 +540,13 @@ func chatCompletionToAnthropic(in []byte) ([]byte, error) {
 	}
 
 	resp := map[string]interface{}{
-		"type":  "message",
-		"id":    "msg_" + strings.TrimPrefix(co.ID, "chatcmpl-"),
-		"model": co.Model,
-		"role":  "assistant",
-		"content": content,
-		"stop_reason":    stopReason,
-		"stop_sequence":  nil,
+		"type":          "message",
+		"id":            "msg_" + strings.TrimPrefix(co.ID, "chatcmpl-"),
+		"model":         co.Model,
+		"role":          "assistant",
+		"content":       content,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
 		"usage": map[string]interface{}{
 			"input_tokens":  co.Usage.PromptTokens,
 			"output_tokens": co.Usage.CompletionTokens,
@@ -373,7 +678,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// window from timing out.
 	var stream *anthropicStream
 	if isStream {
-		stream = openAnthropicStream(w, nil)
+		stream = openAnthropicStream(w, nil, ar.Model)
 	}
 
 	resp, err := upstreamClient.Do(req)
@@ -432,6 +737,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	w.Write(converted)
 }
 
+// anthropicToolCall tracks one streamed tool call from the upstream OpenAI
+// delta and the Anthropic content block allocated for it.
+type anthropicToolCall struct {
+	blockIndex int
+	id         string
+	name       string
+	args       strings.Builder
+	started    bool
+}
+
 // anthropicStream carries the shared state for an open Anthropic Messages SSE
 // response and the helper used to write and flush each event.
 type anthropicStream struct {
@@ -440,6 +755,16 @@ type anthropicStream struct {
 	model        string
 	finished     string
 	outputTokens int
+	inputTokens  int
+
+	// Content block bookkeeping. Anthropic requires content_block_start/stop
+	// pairs and sequential indices; a response may interleave one text block
+	// with zero or more tool_use blocks.
+	nextIndex int
+	textIndex int
+	textOpen  bool
+	tools     map[int]*anthropicToolCall
+	toolOrder []int
 }
 
 // sendError emits an Anthropic SSE `error` event (never raw Chat Completions
@@ -456,6 +781,126 @@ func (s *anthropicStream) sendError(message string) {
 
 func (s *anthropicStream) sendMessageStop() {
 	s.sendEvent("message_stop", `{"type":"message_stop"}`)
+}
+
+// closeTextBlock closes the currently open text content block, if any.
+func (s *anthropicStream) closeTextBlock() {
+	if !s.textOpen {
+		return
+	}
+	s.sendEvent("content_block_stop", anthropicJSON(map[string]interface{}{
+		"type":  "content_block_stop",
+		"index": s.textIndex,
+	}))
+	s.textOpen = false
+}
+
+// emitText opens a text block if needed and emits one text_delta.
+func (s *anthropicStream) emitText(text string) {
+	if text == "" {
+		return
+	}
+	if !s.textOpen {
+		s.textIndex = s.nextIndex
+		s.nextIndex++
+		s.sendEvent("content_block_start", anthropicJSON(map[string]interface{}{
+			"type":  "content_block_start",
+			"index": s.textIndex,
+			"content_block": map[string]interface{}{
+				"type": "text",
+				"text": "",
+			},
+		}))
+		s.textOpen = true
+	}
+	s.outputTokens++
+	s.sendEvent("content_block_delta", anthropicJSON(map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": s.textIndex,
+		"delta": map[string]interface{}{
+			"type": "text_delta",
+			"text": text,
+		},
+	}))
+}
+
+// startTool opens the Anthropic content block for one tool call, flushing any
+// arguments buffered before the id and name were known.
+func (s *anthropicStream) startTool(tc *anthropicToolCall, args string) {
+	tc.blockIndex = s.nextIndex
+	s.nextIndex++
+	tc.started = true
+	s.sendEvent("content_block_start", anthropicJSON(map[string]interface{}{
+		"type":  "content_block_start",
+		"index": tc.blockIndex,
+		"content_block": map[string]interface{}{
+			"type":  "tool_use",
+			"id":    tc.id,
+			"name":  tc.name,
+			"input": map[string]interface{}{},
+		},
+	}))
+	buffered := tc.args.String()
+	tc.args.Reset()
+	if all := buffered + args; all != "" {
+		s.sendEvent("content_block_delta", anthropicJSON(map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": tc.blockIndex,
+			"delta": map[string]interface{}{
+				"type":         "input_json_delta",
+				"partial_json": all,
+			},
+		}))
+	}
+}
+
+// emitToolCall applies one OpenAI streamed tool_call fragment to the matching
+// Anthropic tool_use block, opening it once id and name are known.
+func (s *anthropicStream) emitToolCall(index int, id, name, args string) {
+	tc := s.tools[index]
+	if tc == nil {
+		tc = &anthropicToolCall{}
+		s.tools[index] = tc
+		s.toolOrder = append(s.toolOrder, index)
+	}
+	if id != "" {
+		tc.id = id
+	}
+	if name != "" {
+		tc.name = name
+	}
+	// Tool blocks follow the text block; close any open text block first.
+	s.closeTextBlock()
+
+	if !tc.started {
+		if tc.id == "" || tc.name == "" {
+			// Arguments can arrive before id/name; buffer until we can open the
+			// content_block_start event (Anthropic requires id and name there).
+			tc.args.WriteString(args)
+			return
+		}
+		s.startTool(tc, args)
+		return
+	}
+	if args != "" {
+		s.sendEvent("content_block_delta", anthropicJSON(map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": tc.blockIndex,
+			"delta": map[string]interface{}{
+				"type":         "input_json_delta",
+				"partial_json": args,
+			},
+		}))
+	}
+}
+
+func (s *anthropicStream) hasToolUse() bool {
+	for _, tc := range s.tools {
+		if tc.started {
+			return true
+		}
+	}
+	return false
 }
 
 // readBody consumes the upstream Chat Completions SSE stream and emits the
@@ -501,10 +946,22 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 			Model   string `json:"model"`
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
 		}
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
@@ -513,18 +970,21 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 		if chunk.Model != "" {
 			s.model = chunk.Model
 		}
+		if chunk.Usage != nil {
+			if chunk.Usage.PromptTokens > 0 {
+				s.inputTokens = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens > 0 {
+				s.outputTokens = chunk.Usage.CompletionTokens
+			}
+		}
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			if delta.Content != "" {
-				s.outputTokens++
-				s.sendEvent("content_block_delta", anthropicJSON(map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": 0,
-					"delta": map[string]interface{}{
-						"type": "text_delta",
-						"text": delta.Content,
-					},
-				}))
+				s.emitText(delta.Content)
+			}
+			for _, tc := range delta.ToolCalls {
+				s.emitToolCall(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				s.finished = anthropicStopReason(*chunk.Choices[0].FinishReason)
@@ -532,14 +992,30 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 		}
 	}
 
-	s.sendEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
+	// Close every open block before the message_delta summary.
+	s.closeTextBlock()
+	for _, idx := range s.toolOrder {
+		tc := s.tools[idx]
+		if tc == nil || !tc.started {
+			continue
+		}
+		s.sendEvent("content_block_stop", anthropicJSON(map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": tc.blockIndex,
+		}))
+	}
+
+	stopReason := s.finished
+	if s.hasToolUse() {
+		stopReason = "tool_use"
+	}
 	s.sendEvent("message_delta", anthropicJSON(map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
-			"stop_reason": s.finished,
+			"stop_reason": stopReason,
 		},
 		"usage": map[string]interface{}{
-			"input_tokens":  0,
+			"input_tokens":  s.inputTokens,
 			"output_tokens": s.outputTokens,
 		},
 	}))
@@ -558,7 +1034,7 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 // upstream produces any content. Slow reasoning models can take a long time to
 // send their first header, and the ping keeps the client's connect->first-byte
 // window from timing out.
-func openAnthropicStream(w http.ResponseWriter, src http.Header) *anthropicStream {
+func openAnthropicStream(w http.ResponseWriter, src http.Header, model string) *anthropicStream {
 	flusher, _ := w.(http.Flusher)
 	copyStreamHeaders(w.Header(), src)
 	w.WriteHeader(http.StatusOK)
@@ -566,13 +1042,18 @@ func openAnthropicStream(w http.ResponseWriter, src http.Header) *anthropicStrea
 		flusher.Flush()
 	}
 
-	s := &anthropicStream{
-		msgID:    anthropicMessageID(),
-		model:    "unknown",
-		finished: "end_turn",
+	if strings.TrimSpace(model) == "" {
+		model = "unknown"
 	}
-	// model may be unknown before the first upstream chunk arrives; start with
-	// a placeholder and fill it in as soon as a chunk provides one.
+	s := &anthropicStream{
+		msgID:     anthropicMessageID(),
+		model:     model,
+		finished:  "end_turn",
+		nextIndex: 1,
+		textIndex: 0,
+		textOpen:  true,
+		tools:     map[int]*anthropicToolCall{},
+	}
 	s.sendEvent = func(event, data string) {
 		if _, err := io.WriteString(w, "event: "+event+"\ndata: "+data+"\n\n"); err != nil {
 			return
@@ -609,7 +1090,7 @@ func openAnthropicStream(w http.ResponseWriter, src http.Header) *anthropicStrea
 // opens the stream first, then emits each `content_block_delta` incrementally
 // as upstream chunks arrive so the client sees the first output immediately.
 func streamChatCompletionToAnthropic(w http.ResponseWriter, resp *http.Response) {
-	s := openAnthropicStream(w, resp.Header)
+	s := openAnthropicStream(w, resp.Header, "")
 	s.readBody(resp)
 }
 

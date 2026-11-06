@@ -155,6 +155,8 @@ curl https://your-vercel-domain.vercel.app/health
 |------|------|--------|------|
 | `UPSTREAM_URL` | 否 | `https://integrate.api.nvidia.com` | 上游 API 地址 |
 | `PORT` | 否 | `8080` | 本地运行端口 |
+| `MODEL_MAP` | 否 | 空 | `claude-*` → 上游模型名映射，逗号分隔的 `from=to` |
+| `DEFAULT_MODEL` | 否 | 空 | 未在 `MODEL_MAP` 命中的 `claude-*` 使用的兜底模型 |
 | `ADMIN_PASSWORD` | 否 | 空 | 访问 `/admin` 的密码，追加到 URL 的 `?token=密码` |
 | `KV_REST_API_URL` | 否 | 空 | 管理面板统计持久化（Vercel KV / Upstash Redis）REST 地址 |
 | `KV_REST_API_TOKEN` | 否 | 空 | 管理面板统计持久化对应的 REST Token |

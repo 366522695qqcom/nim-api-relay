@@ -281,10 +281,10 @@ func TestChatCompletionToAnthropicToolCalls(t *testing.T) {
 // lets the test assert that the first delta is emitted before any later chunk
 // is made available.
 type chunkSourcedBody struct {
-	firstEntered  chan struct{}
-	firstRelease  chan struct{}
-	secondEntered chan struct{}
-	secondRelease chan struct{}
+	firstEntered   chan struct{}
+	firstRelease   chan struct{}
+	secondEntered  chan struct{}
+	secondRelease  chan struct{}
 	chunk1, chunk2 string
 	calls          int
 }
@@ -454,6 +454,212 @@ func withStubUpstream(rt http.RoundTripper) (restore func()) {
 	orig := upstreamClient
 	upstreamClient = &http.Client{Transport: rt}
 	return func() { upstreamClient = orig }
+}
+
+func TestMappedModel(t *testing.T) {
+	t.Setenv("MODEL_MAP", "claude-sonnet-4-5=nvidia/nemotron-3.5-bolt-e4b, claude-opus-4-5 = mistralai/mistral-large-4-1t-a52b")
+	t.Setenv("DEFAULT_MODEL", "nvidia/nemotron-3.5-bolt-e4b")
+
+	cases := []struct{ in, want string }{
+		{"claude-sonnet-4-5", "nvidia/nemotron-3.5-bolt-e4b"},
+		{"Claude-Opus-4-5", "mistralai/mistral-large-4-1t-a52b"},
+		{"claude-haiku-4-5", "nvidia/nemotron-3.5-bolt-e4b"}, // DEFAULT_MODEL fallback
+		{"nvidia/nemotron-3.5-bolt-e4b", "nvidia/nemotron-3.5-bolt-e4b"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := mappedModel(c.in); got != c.want {
+			t.Errorf("mappedModel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestAnthropicToChat_ToolsTranslation(t *testing.T) {
+	in := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"max_tokens": 128,
+		"tools": [{
+			"name": "get_weather",
+			"description": "Get the weather",
+			"input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+		}],
+		"tool_choice": {"type": "tool", "name": "get_weather"},
+		"messages": [{"role": "user", "content": "hi"}]
+	}`)
+	out, err := anthropicToChat(in)
+	if err != nil {
+		t.Fatalf("anthropicToChat: %v", err)
+	}
+	var chat map[string]interface{}
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tools, ok := chat["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", chat["tools"])
+	}
+	tool := tools[0].(map[string]interface{})
+	if tool["type"] != "function" {
+		t.Errorf("tools[0].type = %v, want function", tool["type"])
+	}
+	fn, _ := tool["function"].(map[string]interface{})
+	if fn["name"] != "get_weather" {
+		t.Errorf("function.name = %v", fn["name"])
+	}
+	params, _ := fn["parameters"].(map[string]interface{})
+	if params["type"] != "object" {
+		t.Errorf("parameters.type = %v", params["type"])
+	}
+	tc, _ := chat["tool_choice"].(map[string]interface{})
+	fnChoice, _ := tc["function"].(map[string]interface{})
+	if tc["type"] != "function" || fnChoice["name"] != "get_weather" {
+		t.Errorf("tool_choice = %v", chat["tool_choice"])
+	}
+}
+
+func TestAnthropicToChat_ToolRoundTrip(t *testing.T) {
+	// A standard three-turn agent conversation: user → assistant(tool_use) →
+	// user(tool_result). The tool_use block must become assistant.tool_calls and
+	// the tool_result must become a role:"tool" message.
+	in := []byte(`{
+		"model": "nvidia/nemotron-3.5-bolt-e4b",
+		"max_tokens": 128,
+		"messages": [
+			{"role": "user", "content": "read the file"},
+			{"role": "assistant", "content": [
+				{"type": "text", "text": "let me read it"},
+				{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "a.txt"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "call_1", "content": "hello world"},
+				{"type": "text", "text": "summarize it"}
+			]}
+		]
+	}`)
+	out, err := anthropicToChat(in)
+	if err != nil {
+		t.Fatalf("anthropicToChat: %v", err)
+	}
+	var chat struct {
+		Messages []map[string]interface{} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(chat.Messages) != 4 {
+		t.Fatalf("expected 4 chat messages, got %d: %v", len(chat.Messages), chat.Messages)
+	}
+	assistant := chat.Messages[1]
+	if assistant["role"] != "assistant" || assistant["content"] != "let me read it" {
+		t.Errorf("assistant message = %v", assistant)
+	}
+	calls, ok := assistant["tool_calls"].([]interface{})
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant.tool_calls = %v", assistant["tool_calls"])
+	}
+	call := calls[0].(map[string]interface{})
+	if call["id"] != "call_1" || call["type"] != "function" {
+		t.Errorf("tool_call = %v", call)
+	}
+	fn, _ := call["function"].(map[string]interface{})
+	if fn["name"] != "read_file" || fn["arguments"] != `{"path":"a.txt"}` {
+		t.Errorf("tool_call.function = %v", fn)
+	}
+	toolMsg := chat.Messages[2]
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" || toolMsg["content"] != "hello world" {
+		t.Errorf("tool message = %v", toolMsg)
+	}
+	last := chat.Messages[3]
+	if last["role"] != "user" || last["content"] != "summarize it" {
+		t.Errorf("trailing user message = %v", last)
+	}
+}
+
+func TestStreamChatCompletionToAnthropicToolCalls(t *testing.T) {
+	sse := `data: {"model":"m","choices":[{"delta":{"content":"Checking."},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+	rec := httptest.NewRecorder()
+	streamChatCompletionToAnthropic(rec, resp)
+	final := rec.Body.String()
+
+	// Parse the emitted SSE events so assertions do not depend on JSON key order.
+	type event struct {
+		name string
+		data map[string]interface{}
+	}
+	var events []event
+	for _, line := range strings.Split(final, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m); err != nil {
+			t.Fatalf("invalid SSE data %q: %v", line, err)
+		}
+		events = append(events, event{name: stringValue(m["type"]), data: m})
+	}
+
+	starts := map[int]map[string]interface{}{}
+	args := map[int]string{}
+	stops := map[int]bool{}
+	stopReason := ""
+	for _, ev := range events {
+		switch ev.name {
+		case "content_block_start":
+			idx := int(ev.data["index"].(float64))
+			block, _ := ev.data["content_block"].(map[string]interface{})
+			starts[idx] = block
+		case "content_block_delta":
+			idx := int(ev.data["index"].(float64))
+			delta, _ := ev.data["delta"].(map[string]interface{})
+			if delta["type"] == "input_json_delta" {
+				args[idx] += stringValue(delta["partial_json"])
+			}
+		case "content_block_stop":
+			stops[int(ev.data["index"].(float64))] = true
+		case "message_delta":
+			d, _ := ev.data["delta"].(map[string]interface{})
+			stopReason = stringValue(d["stop_reason"])
+		}
+	}
+
+	if starts[0]["type"] != "text" {
+		t.Errorf("block 0 = %v, want text", starts[0])
+	}
+	if starts[1]["type"] != "tool_use" || starts[1]["id"] != "call_1" || starts[1]["name"] != "get_weather" {
+		t.Errorf("block 1 = %v, want tool_use call_1/get_weather", starts[1])
+	}
+	if starts[2]["type"] != "tool_use" || starts[2]["id"] != "call_2" || starts[2]["name"] != "get_time" {
+		t.Errorf("block 2 = %v, want tool_use call_2/get_time", starts[2])
+	}
+	if args[1] != `{"city":"Beijing"}` {
+		t.Errorf("tool call 1 arguments = %q, want {\"city\":\"Beijing\"}", args[1])
+	}
+	if stopReason != "tool_use" {
+		t.Errorf("stop_reason = %q, want tool_use", stopReason)
+	}
+	for _, idx := range []int{0, 1, 2} {
+		if !stops[idx] {
+			t.Errorf("content block %d never stopped:\n%s", idx, final)
+		}
+	}
 }
 
 func TestHandleMessagesConversionFailureReturnsEnvelope(t *testing.T) {
