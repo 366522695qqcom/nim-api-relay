@@ -1,9 +1,10 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -61,8 +62,8 @@ func anthropicSystemText(system json.RawMessage) string {
 }
 
 // anthropicContentToChat flattens an Anthropic message `content` (a string or
-// an array of blocks) into a plain chat content string. Text blocks are
-// concatenated; image blocks are passed through for multimodal support.
+// an array of blocks) into plain chat content. Text blocks are concatenated and
+// image blocks are converted into the Chat Completions image_url form.
 func anthropicContentToChat(content interface{}) interface{} {
 	switch v := content.(type) {
 	case nil:
@@ -72,7 +73,6 @@ func anthropicContentToChat(content interface{}) interface{} {
 	case []interface{}:
 		var text strings.Builder
 		var parts []interface{}
-		hasNonText := false
 		for _, p := range v {
 			m, ok := p.(map[string]interface{})
 			if !ok {
@@ -81,17 +81,21 @@ func anthropicContentToChat(content interface{}) interface{} {
 			switch t, _ := m["type"].(string); t {
 			case "", "text":
 				text.WriteString(stringValue(m["text"]))
-			case "image", "image_url":
-				hasNonText = true
-				parts = append(parts, m)
+			default:
+				// image / image_url blocks must be restructured for OpenAI:
+				// Anthropic uses {"type":"image","source":{"type":"base64",…}}
+				// while Chat Completions expects {"type":"image_url","image_url":{…}}.
+				if part, ok := anthropicContentPartToChat(m); ok {
+					parts = append(parts, part)
+				}
 			}
 		}
-		if hasNonText && text.Len() > 0 {
-			parts = append([]interface{}{
-				map[string]interface{}{"type": "text", "text": text.String()},
-			}, parts...)
-		}
-		if hasNonText {
+		if len(parts) > 0 {
+			if text.Len() > 0 {
+				parts = append([]interface{}{
+					map[string]interface{}{"type": "text", "text": text.String()},
+				}, parts...)
+			}
 			return parts
 		}
 		return text.String()
@@ -570,6 +574,11 @@ func writeAnthropicError(w http.ResponseWriter, status int, message string) {
 	w.Write(body)
 }
 
+// isEventStream reports whether a Content-Type denotes an SSE stream.
+func isEventStream(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")
+}
+
 // extractErrorMessage pulls a human-readable message out of an upstream error
 // body. It handles OpenAI/NVIDIA-style {"error":{"message":...}} and
 // Anthropic-style {"error":{"type":...,"message":...}} shapes plus a bare
@@ -699,6 +708,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	diagUpstream = resp.StatusCode
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		msg := fmt.Sprintf("upstream returned HTTP %d redirect; refused to follow it to protect credentials", resp.StatusCode)
+		diagUpErr = msg
+		if stream != nil {
+			stream.sendError(msg)
+			stream.sendMessageStop()
+			return
+		}
+		writeAnthropicError(w, http.StatusBadGateway, msg)
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		// Surface upstream errors as Anthropic-style envelopes rather than the
 		// raw body. If the stream was already opened with a 200, surface the
@@ -720,6 +740,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStream {
+		// A 200 with a JSON body (e.g. {"error":"rate limited"}) is not a stream.
+		// Translating it silently would produce an empty but "complete" reply,
+		// hiding the real failure from the client and the logs.
+		if !isEventStream(resp.Header.Get("Content-Type")) {
+			body, _ := readAllCloser(resp.Body)
+			upErr := extractErrorMessage(body)
+			diagUpErr = upErr
+			stream.sendError("upstream did not return a stream: " + upErr)
+			stream.sendMessageStop()
+			return
+		}
 		stream.readBody(resp)
 		return
 	}
@@ -727,6 +758,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	raw, err := readAllCloser(resp.Body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "failed to read upstream response")
+		return
+	}
+	if msg, ok := upstreamErrorPayload(raw); ok {
+		diagUpErr = msg
+		writeAnthropicError(w, http.StatusBadGateway, msg)
 		return
 	}
 	converted, err := chatCompletionToAnthropic(raw)
@@ -915,39 +951,31 @@ func (s *anthropicStream) hasToolUse() bool {
 func (s *anthropicStream) readBody(resp *http.Response) {
 	defer resp.Body.Close()
 
-	buf := bufio.NewReaderSize(resp.Body, 4096)
+	rd := newSSEReader(resp.Body)
 	var streamErr error
+	sawDone := false
+	sawFinish := false
 	for {
-		line, err := buf.ReadString('\n')
-		hard := err != nil && err != io.EOF
+		data, err := rd.Next()
 		if err != nil {
-			if line == "" {
-				// Clean end of the upstream stream (EOF) — unless the error is a
-				// hard (non-EOF) failure, in which case this is an abnormal stop.
-				if hard {
-					streamErr = err
-				}
-				break
-			}
-			// Leftover partial line alongside the error: remember a hard failure
-			// but still process the trailing line below.
-			if hard {
+			if err != io.EOF {
 				streamErr = err
 			}
+			break
 		}
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+		if data == "" {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
-			// Stream closed normally.
-			streamErr = nil
+			sawDone = true
 			break
 		}
 
 		var chunk struct {
-			Model   string `json:"model"`
+			Model string `json:"model"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
@@ -969,6 +997,15 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 		}
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
+		}
+		// Some providers report failures as an in-band error object on a 200.
+		if chunk.Error != nil {
+			msg := strings.TrimSpace(chunk.Error.Message)
+			if msg == "" {
+				msg = "upstream reported an error"
+			}
+			streamErr = errors.New(msg)
+			break
 		}
 
 		if chunk.Model != "" {
@@ -992,8 +1029,15 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				s.finished = anthropicStopReason(*chunk.Choices[0].FinishReason)
+				sawFinish = true
 			}
 		}
+	}
+
+	// EOF without [DONE] or a finish_reason means the upstream connection was
+	// cut mid-response; report it instead of closing as a complete message.
+	if streamErr == nil && !sawDone && !sawFinish {
+		streamErr = io.ErrUnexpectedEOF
 	}
 
 	// Close every open block before the message_delta summary.

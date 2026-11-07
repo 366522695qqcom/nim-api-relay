@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -35,6 +34,7 @@ func copyStreamHeaders(dst, src http.Header) {
 	}
 	dst.Set("Content-Type", "text/event-stream")
 	dst.Set("Cache-Control", "no-cache")
+	dst.Set("X-Content-Type-Options", "nosniff")
 	dst.Del("Content-Length")
 	dst.Del("Transfer-Encoding")
 }
@@ -99,9 +99,55 @@ func responsesInputToMessages(in json.RawMessage) ([]map[string]interface{}, err
 		if content == nil {
 			content = ""
 		}
-		out = append(out, map[string]interface{}{"role": role, "content": content})
+		out = append(out, map[string]interface{}{
+			"role":    role,
+			"content": responsesContentToChat(content),
+		})
 	}
 	return out, nil
+}
+
+// responsesContentToChat converts a Responses content array into the Chat
+// Completions form. Responses names text parts "input_text"/"output_text" and
+// images "input_image", none of which Chat Completions understands.
+func responsesContentToChat(content interface{}) interface{} {
+	arr, ok := content.([]interface{})
+	if !ok {
+		return content
+	}
+	var text strings.Builder
+	var parts []interface{}
+	for _, p := range arr {
+		m, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch t, _ := m["type"].(string); t {
+		case "", "text", "input_text", "output_text":
+			text.WriteString(stringValue(m["text"]))
+		case "input_image", "image_url":
+			url := stringValue(m["image_url"])
+			if url == "" {
+				url = stringValue(m["url"])
+			}
+			if url == "" {
+				continue // file_id-based images have no Chat Completions equivalent
+			}
+			parts = append(parts, map[string]interface{}{
+				"type":      "image_url",
+				"image_url": map[string]interface{}{"url": url},
+			})
+		}
+	}
+	if len(parts) > 0 {
+		if text.Len() > 0 {
+			parts = append([]interface{}{
+				map[string]interface{}{"type": "text", "text": text.String()},
+			}, parts...)
+		}
+		return parts
+	}
+	return text.String()
 }
 
 // responsesToChat translates a Responses API request body into a Chat
@@ -407,13 +453,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	if rejectUpstreamRedirect(w, resp) {
+		return
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		// Pass through upstream errors, but only whitelisted headers.
-		removeHopByHopHeaders(resp.Header)
-		copySafeHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
+		// Normalize upstream failures into our JSON envelope, keeping the status.
 		body, _ := readAllCloser(resp.Body)
-		w.Write(body)
+		writeRelayError(w, resp.StatusCode, extractErrorMessage(body))
 		return
 	}
 
@@ -426,6 +473,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStream {
+		if !isEventStream(resp.Header.Get("Content-Type")) {
+			body, _ := readAllCloser(resp.Body)
+			writeRelayError(w, http.StatusBadGateway,
+				"upstream did not return a stream: "+extractErrorMessage(body))
+			return
+		}
 		streamChatCompletionToResponses(w, resp)
 		return
 	}
@@ -435,11 +488,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeRelayError(w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
+	if msg, ok := upstreamErrorPayload(raw); ok {
+		writeRelayError(w, http.StatusBadGateway, msg)
+		return
+	}
 	converted, err := chatCompletionToResponse(raw)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(raw)
+		// Never echo an unconvertible body (often upstream HTML) from our domain.
+		writeRelayError(w, http.StatusBadGateway, "upstream returned an invalid response")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -596,35 +652,31 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 		"response": responseObj("in_progress", []interface{}{}),
 	})
 
-	buf := bufio.NewReaderSize(resp.Body, 4096)
+	rd := newSSEReader(resp.Body)
 	streamErr := ""
+	sawDone := false
 	for {
-		line, err := buf.ReadString('\n')
-		hard := err != nil && err != io.EOF
+		data, err := rd.Next()
 		if err != nil {
-			if line == "" {
-				if hard {
-					streamErr = err.Error()
-				}
-				break
-			}
-			if hard {
+			if err != io.EOF {
 				streamErr = err.Error()
 			}
+			break
 		}
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+		if data == "" {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
-			streamErr = ""
+			sawDone = true
 			break
 		}
 
 		var chunk struct {
-			ID      string `json:"id"`
-			Model   string `json:"model"`
+			ID    string `json:"id"`
+			Model string `json:"model"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content          string `json:"content"`
@@ -648,6 +700,14 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		if chunk.Error != nil {
+			msg := strings.TrimSpace(chunk.Error.Message)
+			if msg == "" {
+				msg = "upstream reported an error"
+			}
+			streamErr = msg
+			break
 		}
 
 		if chunk.ID != "" {
@@ -703,8 +763,14 @@ func streamChatCompletionToResponses(w http.ResponseWriter, resp *http.Response)
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				finished = *chunk.Choices[0].FinishReason
+				sawDone = true
 			}
 		}
+	}
+	// EOF without [DONE] or a finish_reason means the upstream connection was
+	// cut mid-response; fail the response instead of reporting completion.
+	if streamErr == "" && !sawDone {
+		streamErr = io.ErrUnexpectedEOF.Error()
 	}
 
 	// Close open items in output order.

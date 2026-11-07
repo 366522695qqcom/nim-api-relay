@@ -174,7 +174,7 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := scheme + "://" + r.Host
 
-	st, logs, _ := kvStore.Stats()
+	st, logs, statsErr := kvStore.Stats()
 
 	byIP := sortedCounts(st.ByIP)
 	byKey := sortedCounts(st.ByKey)
@@ -187,9 +187,17 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	// Address bar + health.
 	b.WriteString("<div class=\"addrbar\"><span class=\"dot\" aria-hidden=\"true\"></span>")
 	b.WriteString("<span class=\"lbl\">请求地址</span><code>" + htmlEscape(baseURL) + "</code>")
-	b.WriteString("<span class=\"status\">● 正常</span></div>\n")
+	if statsErr != nil {
+		b.WriteString("<span class=\"status bad\">● 存储异常</span></div>\n")
+	} else {
+		b.WriteString("<span class=\"status\">● 正常</span></div>\n")
+	}
 
-	if !kvStore.Configured() {
+	if statsErr != nil {
+		// Distinguishes "KV is broken" from "there is genuinely no traffic".
+		b.WriteString("<div class=\"warn\">⚠ 读取统计数据失败：" + htmlEscape(statsErr.Error()) +
+			"。以下数字可能为 0 且不可信，请检查 KV 凭据与网络。</div>\n")
+	} else if !kvStore.Configured() {
 		b.WriteString("<div class=\"warn\">⚠ 未配置 Vercel KV（KV_REST_API_URL / KV_REST_API_TOKEN），当前仅在本进程内累计，Serverless 部署时不会跨请求持久化。</div>\n")
 	}
 
@@ -300,6 +308,7 @@ const adminHead = `<!DOCTYPE html>
   .addrbar .lbl{color:var(--muted);font-size:13px}
   .addrbar code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;color:var(--text)}
   .addrbar .status{margin-left:auto;font-size:12px;color:var(--good);font-weight:600;letter-spacing:.4px}
+  .addrbar .status.bad{color:#ff7b72}
   /* KV warn */
   .warn{display:flex;gap:10px;align-items:flex-start;color:#ffd9a3;background:#221a0d;border:1px solid #4d3a17;
     padding:12px 14px;border-radius:var(--radius);font-size:13px;margin:-8px 0 18px}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -74,7 +75,15 @@ var upstreamClient = func() *http.Client {
 	// Slow reasoning models (e.g. moonshotai/kimi-k3) can take a long time to
 	// send their first response header. Give them ample time to avoid 502s.
 	transport.ResponseHeaderTimeout = 300 * time.Second
-	return &http.Client{Transport: transport}
+	return &http.Client{
+		Transport: transport,
+		// Never follow redirects. Go strips some credentials cross-origin, but
+		// not x-api-key (which Anthropic clients use), so any upstream 302 would
+		// replay the client's key to an arbitrary host.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }()
 
 // isResponsesPath reports whether the request targets the OpenAI Responses API.
@@ -137,11 +146,17 @@ func removeHopByHopHeaders(h http.Header) {
 }
 
 // copySafeHeaders copies only whitelisted upstream response headers to dst.
+// It also neutralizes upstream HTML: serving attacker-controlled markup from
+// this domain would otherwise let an upstream execute script here.
 func copySafeHeaders(dst, src http.Header) {
 	for _, k := range safeResponseHeaders {
 		for _, v := range src.Values(k) {
 			dst.Add(k, v)
 		}
+	}
+	dst.Set("X-Content-Type-Options", "nosniff")
+	if strings.HasPrefix(strings.ToLower(dst.Get("Content-Type")), "text/html") {
+		dst.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
 	}
 }
 
@@ -187,9 +202,10 @@ func writeRelayError(w http.ResponseWriter, status int, message string) {
 // healthHandler reports relay service health without hitting the upstream.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	payload := map[string]string{
-		"status":   "ok",
-		"service":  "nim-relay",
-		"upstream": upstreamURL().String(),
+		"status":  "ok",
+		"service": "nim-relay",
+		// Redacted() hides any user:password embedded in UPSTREAM_URL.
+		"upstream": upstreamURL().Redacted(),
 	}
 	body, _ := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -204,6 +220,37 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>已部署</title></head><body><p>您已成功部署本项目</p></body></html>"))
+}
+
+// upstreamErrorPayload reports an error object returned with HTTP 200. Some
+// providers report failures in-band; without this check they would be converted
+// into an empty but seemingly successful response.
+func upstreamErrorPayload(body []byte) (string, bool) {
+	var e struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &e) != nil || len(e.Error) == 0 || string(e.Error) == "null" {
+		return "", false
+	}
+	msg := extractErrorMessage(body)
+	if msg == "" {
+		msg = "upstream reported an error"
+	}
+	return msg, true
+}
+
+// rejectUpstreamRedirect closes the response and reports a blocked redirect.
+// Redirects are never followed (that would replay client credentials to the
+// target), and returning a bare 3xx would leave clients with a Location-less
+// response, so surface it as a relay error instead.
+func rejectUpstreamRedirect(w http.ResponseWriter, resp *http.Response) bool {
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return false
+	}
+	resp.Body.Close()
+	writeRelayError(w, http.StatusBadGateway,
+		fmt.Sprintf("upstream returned HTTP %d redirect; refused to follow it to protect credentials", resp.StatusCode))
+	return true
 }
 
 // isBodyTooLarge reports whether err came from the request body size limit.
@@ -329,6 +376,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("relay: upstream request failed: %v", err)
 		writeRelayError(w, http.StatusBadGateway, "upstream request failed")
+		return
+	}
+	if rejectUpstreamRedirect(w, resp) {
 		return
 	}
 
