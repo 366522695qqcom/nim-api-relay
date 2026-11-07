@@ -155,9 +155,23 @@ func copySafeHeaders(dst, src http.Header) {
 		}
 	}
 	dst.Set("X-Content-Type-Options", "nosniff")
-	if strings.HasPrefix(strings.ToLower(dst.Get("Content-Type")), "text/html") {
+	if isScriptableContentType(dst.Get("Content-Type")) {
 		dst.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
 	}
+}
+
+// isScriptableContentType reports whether a browser may execute script when it
+// opens the response as a document. Besides HTML this covers SVG and XHTML,
+// which can embed <script> yet are not covered by Go's cross-origin credential
+// stripping; plain XML variants can reach script through stylesheet PIs.
+func isScriptableContentType(contentType string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	switch mediaType {
+	case "text/html", "application/xhtml+xml", "image/svg+xml",
+		"text/xml", "application/xml":
+		return true
+	}
+	return false
 }
 
 func forwardResponse(w http.ResponseWriter, resp *http.Response) {

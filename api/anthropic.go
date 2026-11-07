@@ -1053,6 +1053,17 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 		}))
 	}
 
+	// A failed stream must not look like a normally finished message. Anthropic
+	// terminates a stream with an `error` event, so emit it instead of a
+	// message_delta/message_stop pair that would report a clean end_turn.
+	if streamErr != nil {
+		// The upstream stream died before a clean [DONE]: surface an Anthropic
+		// `error` SSE event (never raw Chat Completions chunk JSON) so the
+		// client can report the failure.
+		s.sendError("upstream stream failed: " + streamErr.Error())
+		return
+	}
+
 	stopReason := s.finished
 	if s.hasToolUse() {
 		stopReason = "tool_use"
@@ -1067,12 +1078,6 @@ func (s *anthropicStream) readBody(resp *http.Response) {
 			"output_tokens": s.outputTokens,
 		},
 	}))
-	if streamErr != nil {
-		// The upstream stream died before a clean [DONE]: surface an Anthropic
-		// `error` SSE event (never raw Chat Completions chunk JSON) so the
-		// client can report the failure, then close cleanly with message_stop.
-		s.sendError("upstream stream failed: " + streamErr.Error())
-	}
 	s.sendMessageStop()
 }
 

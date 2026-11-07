@@ -124,11 +124,11 @@ func responsesContentToChat(content interface{}) interface{} {
 		}
 		switch t, _ := m["type"].(string); t {
 		case "", "text", "input_text", "output_text":
-			text.WriteString(stringValue(m["text"]))
+			text.WriteString(stringField(m, "text"))
 		case "input_image", "image_url":
-			url := stringValue(m["image_url"])
+			url := stringField(m, "image_url")
 			if url == "" {
-				url = stringValue(m["url"])
+				url = stringField(m, "url")
 			}
 			if url == "" {
 				continue // file_id-based images have no Chat Completions equivalent
@@ -404,6 +404,14 @@ func stringValue(v interface{}) string {
 	return stringOrJSON(v)
 }
 
+// stringField returns m[key] only when it is actually a string. Unlike
+// stringValue it never turns a missing value into the literal `null`, which is
+// not a usable URL or text.
+func stringField(m map[string]interface{}, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
 func stringOrJSON(v interface{}) string {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -459,7 +467,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	if resp.StatusCode != http.StatusOK {
 		// Normalize upstream failures into our JSON envelope, keeping the status.
+		// writeRelayError only sets Content-Type, so preserve the upstream
+		// Retry-After first: rate-limited clients rely on it for backoff.
 		body, _ := readAllCloser(resp.Body)
+		for _, v := range resp.Header.Values("Retry-After") {
+			w.Header().Add("Retry-After", v)
+		}
 		writeRelayError(w, resp.StatusCode, extractErrorMessage(body))
 		return
 	}

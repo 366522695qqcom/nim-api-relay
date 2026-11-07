@@ -832,18 +832,21 @@ func TestStreamChatCompletionToAnthropicMidStreamError(t *testing.T) {
 		"content_block_delta",
 		"\"text\":\"Hello\"",
 		"content_block_stop",
-		"message_delta",
 		"event: error",
 		"api_error",
-		"message_stop",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("mid-stream failure output missing %q:\n%s", want, out)
 		}
 	}
-	// The error SSE event must be emitted before message_stop closes the stream.
-	if iErr, iStop := strings.Index(out, "event: error"), strings.Index(out, "message_stop"); iErr < 0 || iStop < 0 || iErr > iStop {
-		t.Errorf("expected error event before message_stop:\n%s", out)
+	// The error terminates the stream: no success summary may follow it.
+	for _, unwanted := range []string{"message_delta", "message_stop", "end_turn"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("mid-stream failure must not emit %q:\n%s", unwanted, out)
+		}
+	}
+	if iBlock, iErr := strings.Index(out, "content_block_stop"), strings.Index(out, "event: error"); iBlock < 0 || iErr < 0 || iErr < iBlock {
+		t.Errorf("expected error event after the closed content block:\n%s", out)
 	}
 	// No raw Chat Completions chunk JSON should be forwarded as a data: payload.
 	if strings.Contains(out, "finish_reason") {

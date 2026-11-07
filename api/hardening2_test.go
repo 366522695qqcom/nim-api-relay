@@ -137,6 +137,16 @@ func TestMessagesStreamPrematureEOFReportsError(t *testing.T) {
 	if !strings.Contains(body, "partial") {
 		t.Errorf("partial content should still be delivered:\n%s", body)
 	}
+	// A failed stream must not also look like a clean end_turn completion.
+	if strings.Contains(body, "event: message_delta") {
+		t.Errorf("failed stream must not send message_delta:\n%s", body)
+	}
+	if strings.Contains(body, "end_turn") {
+		t.Errorf("failed stream must not report end_turn:\n%s", body)
+	}
+	if strings.Contains(body, "event: message_stop") {
+		t.Errorf("failed stream must not end with message_stop:\n%s", body)
+	}
 }
 
 func TestResponsesStreamPrematureEOFReportsFailure(t *testing.T) {
@@ -182,14 +192,81 @@ func TestSSEReaderJoinsMultilineData(t *testing.T) {
 }
 
 func TestCopySafeHeadersNeutralizesHTML(t *testing.T) {
-	dst := http.Header{}
-	copySafeHeaders(dst, http.Header{"Content-Type": {"text/html; charset=utf-8"}})
-
-	if dst.Get("X-Content-Type-Options") != "nosniff" {
-		t.Errorf("missing nosniff: %v", dst)
+	cases := []struct {
+		name    string
+		ct      string
+		wantCSP bool
+	}{
+		{"html", "text/html; charset=utf-8", true},
+		{"xhtml", "application/xhtml+xml", true},
+		{"svg", "image/svg+xml", true},
+		{"xml", "application/xml", true},
+		{"json", "application/json", false},
+		{"sse", "text/event-stream", false},
 	}
-	if csp := dst.Get("Content-Security-Policy"); !strings.Contains(csp, "sandbox") {
-		t.Errorf("upstream HTML not sandboxed: %q", csp)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := http.Header{}
+			copySafeHeaders(dst, http.Header{"Content-Type": {tc.ct}})
+
+			if dst.Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("missing nosniff for %s", tc.ct)
+			}
+			csp := dst.Get("Content-Security-Policy")
+			if tc.wantCSP && !strings.Contains(csp, "sandbox") {
+				t.Errorf("%s not sandboxed: %q", tc.ct, csp)
+			}
+			if !tc.wantCSP && csp != "" {
+				t.Errorf("%s should not receive a CSP: %q", tc.ct, csp)
+			}
+		})
+	}
+}
+
+func TestResponsesUpstreamErrorKeepsRetryAfter(t *testing.T) {
+	restore := withStubUpstream(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header: http.Header{
+				"Content-Type": {"application/json"},
+				"Retry-After":  {"7"},
+			},
+			Body: io.NopCloser(strings.NewReader(`{"error":{"message":"slow down"}}`)),
+		}, nil
+	}))
+	defer restore()
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"m","input":"hi"}`))
+	rec := httptest.NewRecorder()
+	Handler(rec, r)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "7" {
+		t.Errorf("Retry-After = %q, want 7", got)
+	}
+	if !strings.Contains(rec.Body.String(), "slow down") {
+		t.Errorf("upstream error message lost: %s", rec.Body.String())
+	}
+}
+
+func TestResponsesContentSkipsFileIDImageAndMissingText(t *testing.T) {
+	content := []interface{}{
+		map[string]interface{}{"type": "input_image", "file_id": "file-123"},
+		map[string]interface{}{"type": "input_text"},
+		map[string]interface{}{"type": "input_text", "text": "describe"},
+	}
+	got, ok := responsesContentToChat(content).(string)
+	if !ok {
+		t.Fatalf("content = %#v, want a plain string (image without url must be dropped)", responsesContentToChat(content))
+	}
+	if strings.Contains(got, "null") {
+		t.Errorf("missing fields leaked the literal null: %q", got)
+	}
+	if got != "describe" {
+		t.Errorf("text = %q, want describe", got)
 	}
 }
 
